@@ -587,17 +587,21 @@ impl NabyTune {
         // "Listen again" of its own further down).
         let seeds = self.home.tracks.clone();
         // Sideways when it's wider than the page (up to 8 songs).
-        let mut again = div().id("listen-again").flex().gap_5().overflow_x_scroll().pb_2();
+        let mut again = Vec::new();
         for (i, track) in seeds.iter().enumerate() {
             let rise = self.rise(i);
             let Some(frame) = self.home.motion.get_mut(i).map(|state| state.frame(rise, window, cx)) else { continue };
             let card = Self::card(("seed", i).into(), art(self, &track.video_id), track.title.clone(), track.artist.clone(), current.as_deref() == Some(track.video_id.as_str()))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.shelf_dragged {
+                        return;
+                    }
                     let list = this.tracks_of(Source::Seeds);
                     this.play_from(list, i, cx);
                 }));
-            again = again.child(frame.apply(card));
+            again.push(frame.apply(card).into_any_element());
         }
+        let again = (!again.is_empty()).then(|| self.shelf("listen-again".into(), Self::heading(t("Played lately"), 20.0), again, window, cx));
 
         let mut page = div()
             .id("home")
@@ -611,7 +615,7 @@ impl NabyTune {
             .gap_6()
             .child(Self::heading(t("Home"), 30.0))
             // Nothing played yet (a fresh install): no empty shelf.
-            .when(!seeds.is_empty(), |d| d.child(div().flex().flex_col().gap_3().child(Self::heading(t("Played lately"), 20.0)).child(again)));
+            .children(again);
 
         // Songs like the ones played lately.
         if !self.recommended.is_empty() {
@@ -648,7 +652,11 @@ impl NabyTune {
         for (n, (title, songs, cards)) in shelves.into_iter().enumerate() {
             let rise = self.rise(n + 2);
             let Some(frame) = self.feed_motion.get_mut(n).map(|state| state.frame(rise, window, cx)) else { continue };
-            let mut shelf = div().flex().flex_col().gap_3().child(Self::heading(title, 20.0));
+            let mut shelf = div().flex().flex_col().gap_3();
+            // The title on top, unless the shelf is only cards: then it sits by their ‹ ›.
+            if cards.is_empty() || !songs.is_empty() {
+                shelf = shelf.child(Self::heading(title.clone(), 20.0));
+            }
             if !songs.is_empty() {
                 let mut grid = div().flex().flex_wrap();
                 for (i, track) in songs.iter().take(12).enumerate() {
@@ -657,7 +665,9 @@ impl NabyTune {
                 shelf = shelf.child(div().mx(px(-12.0)).child(grid));
             }
             if !cards.is_empty() {
-                let mut row = div().id(gpui::ElementId::NamedInteger("shelf-cards".into(), n as u64)).flex().gap_5().overflow_x_scroll().pb_2();
+                // Named by its first card too, so a new Home starts each row at its start.
+                let key: SharedString = format!("home-{n}-{}", card_key(&cards[0])).into();
+                let mut row = Vec::new();
                 for (i, card) in cards.into_iter().enumerate() {
                     let opening = self.opening.as_ref().is_some_and(|t| t.as_ref() == card.title);
                     let element = Self::card(
@@ -668,10 +678,16 @@ impl NabyTune {
                         false,
                     )
                     .when(opening, |d| d.opacity(0.6))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_card(card.clone(), cx)));
-                    row = row.child(element);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.shelf_dragged {
+                            this.open_card(card.clone(), cx);
+                        }
+                    }));
+                    row.push(element.into_any_element());
                 }
-                shelf = shelf.child(row);
+                // Songs and cards both: the title is over the songs, the cards under them.
+                let heading = if songs.is_empty() { Some(Self::heading(title.clone(), 20.0)) } else { None };
+                shelf = shelf.child(self.shelf(key, div().children(heading), row, window, cx));
             }
             page = page.child(frame.apply(shelf));
         }

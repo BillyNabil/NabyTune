@@ -118,7 +118,10 @@ impl NabyTune {
                     window_background: WindowBackgroundAppearance::MicaBackdrop,
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| MiniPlayer::new(entity, cx)),
+                |window, cx| {
+                    crate::smooth_move::smooth_moves(window);
+                    cx.new(|cx| MiniPlayer::new(entity, cx))
+                },
             );
             if let Ok(handle) = opened {
                 app.update(cx, |app, cx| {

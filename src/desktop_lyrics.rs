@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, rgba, size, AnyElement, App, Bounds, Context, Entity, FontWeight, Point, SharedString, Subscription, TitlebarOptions, Window,
+    div, hsla, point, prelude::*, px, rgb, rgba, size, AnyElement, App, BoxShadow, Bounds, Context, Entity, FontWeight, Point, SharedString, Subscription, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind, WindowOptions,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -25,8 +25,64 @@ const WIDTH: f32 = 980.0;
 pub(crate) const SMALLEST: f32 = 20.0;
 pub(crate) const LARGEST: f32 = 56.0;
 const DEFAULT_SIZE: f32 = 32.0;
-/// Room round the words for their shadow to fade out in.
-const SHADOW: f32 = 18.0;
+/// Room round the words for their shadow to fade out in: the shadow reaches three blurs (plus
+/// its spread) past the words, and all of that has to be inside the window, or its edge shows
+/// as a straight cut.
+const SHADOW: f32 = 36.0;
+const SHADOW_BLUR: f32 = 11.0;
+const SHADOW_SPREAD: f32 = 2.0;
+
+/// Which side of the window the words keep to: centred, or to one side so they can sit in a
+/// corner of the screen.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    pub const ALL: [Align; 3] = [Align::Left, Align::Center, Align::Right];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Align::Left => t("Left"),
+            Align::Center => t("Center"),
+            Align::Right => t("Right"),
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.key() == key)
+    }
+
+    fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|a| *a == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Segoe's align-left, -centre and -right glyphs.
+    fn glyph(self) -> &'static str {
+        match self {
+            Align::Left => "\u{E8E4}",
+            Align::Center => "\u{E8E3}",
+            Align::Right => "\u{E8E2}",
+        }
+    }
+}
+
+/// Which side the words keep to, as kept (centred until another is picked).
+pub(crate) fn align() -> Align {
+    settings::get("desk_lyrics_align").and_then(|k| Align::from_key(&k)).unwrap_or(Align::Center)
+}
 
 /// What sits behind the words.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -147,7 +203,12 @@ impl NabyTune {
             let (x, y) = v.split_once(',')?;
             Some(Point::new(px(x.parse().ok()?), px(y.parse().ok()?)))
         });
-        // Where it was last, else low and centred, above the taskbar.
+        // Where it was last (if that's still on a screen: a monitor may have gone), else low
+        // and centred, above the taskbar.
+        let origin = origin.filter(|at| {
+            let middle = Point::new(at.x + px(WIDTH / 2.0), at.y + px(height / 2.0));
+            cx.displays().iter().any(|d| d.bounds().contains(&middle))
+        });
         let bounds = match origin {
             Some(at) => Bounds::new(at, size(px(WIDTH), px(height))),
             None => {
@@ -230,6 +291,12 @@ impl NabyTune {
     /// What sits behind the floating words.
     pub(crate) fn set_desktop_lyrics_backdrop(&mut self, backdrop: Backdrop, cx: &mut Context<Self>) {
         settings::set("desk_lyrics_backdrop", backdrop.key());
+        cx.notify();
+    }
+
+    /// Which side of the window the words keep to.
+    pub(crate) fn set_desktop_lyrics_align(&mut self, align: Align, cx: &mut Context<Self>) {
+        settings::set("desk_lyrics_align", align.key());
         cx.notify();
     }
 
@@ -367,6 +434,7 @@ impl Render for DesktopLyrics {
         let playing = app.current().is_some();
         let backdrop = backdrop();
         let border = bordered();
+        let align = align();
         // The line being sung, and what comes under it: its romaji when that's on, else the
         // next line.
         let (line, under): (Option<crate::lyrics::Line>, Option<SharedString>) = match (&app.lyrics, app.sung_line()) {
@@ -400,7 +468,11 @@ impl Render for DesktopLyrics {
         // The sung line: word by word when the source timed its words.
         let main = match &line {
             Some(l) if !l.words.is_empty() => {
-                let mut row = div().flex().flex_wrap().justify_center();
+                let mut row = div().flex().flex_wrap().map(|d| match align {
+                    Align::Left => d.justify_start(),
+                    Align::Center => d.justify_center(),
+                    Align::Right => d.justify_end(),
+                });
                 for word in &l.words {
                     let done = word.end <= now;
                     let on = word.at <= now;
@@ -416,11 +488,22 @@ impl Render for DesktopLyrics {
             Some(l) => div().text_color(lit).child(l.text.clone()).into_any_element(),
             None => div().text_color(rgba(0xffffffb0)).text_size(px(text * 0.62)).children(fallback).into_any_element(),
         };
-        let mut words = div()
+        // Lines (and the whole block) to the side the listener picked.
+        let side = |d: gpui::Div| match align {
+            Align::Left => d.items_start(),
+            Align::Center => d.items_center(),
+            Align::Right => d.items_end(),
+        };
+        let text_side = |d: gpui::Div| match align {
+            Align::Left => d.text_left(),
+            Align::Center => d.text_center(),
+            Align::Right => d.text_right(),
+        };
+        let words = div()
             .relative()
             .flex()
             .flex_col()
-            .items_center()
+            .map(side)
             .gap(px(4.0))
             .px(px(28.0))
             .py(px(10.0))
@@ -430,22 +513,19 @@ impl Render for DesktopLyrics {
                 Backdrop::Dark => d.bg(rgba(0x1212_12dc)),
                 _ => d,
             })
-            .when(border && matches!(backdrop, Backdrop::Glass | Backdrop::Dark), |d| d.border_1().border_color(rgba(0xffffff2e)));
-        if backdrop == Backdrop::Shadow {
-            // A dark glow with no edge: the blur is drawn within its element, so the element
-            // reaches well past the dark shape and the glow fades out inside it, never cut off
-            // in a box.
-            words = words.child(
-                div()
-                    .absolute()
-                    .top(px(-SHADOW))
-                    .bottom(px(-SHADOW))
-                    .left(px(-SHADOW * 1.5))
-                    .right(px(-SHADOW * 1.5))
-                    .blur(px(SHADOW * 0.8))
-                    .child(div().absolute().top(px(SHADOW)).bottom(px(SHADOW)).left(px(SHADOW * 1.5)).right(px(SHADOW * 1.5)).rounded(px(40.0)).bg(rgba(0x0000_0099))),
-            );
-        }
+            .when(border && matches!(backdrop, Backdrop::Glass | Backdrop::Dark), |d| d.border_1().border_color(rgba(0xffffff2e)))
+            // A dark glow with no edge: a soft shadow of the words' own rounded box, which
+            // fades out within the room left round the words (SHADOW), so the window's edge
+            // never cuts it.
+            .when(backdrop == Backdrop::Shadow, |d| {
+                d.shadow(vec![BoxShadow {
+                    color: hsla(0.0, 0.0, 0.0, 0.55),
+                    offset: point(px(0.0), px(0.0)),
+                    blur_radius: px(SHADOW_BLUR),
+                    spread_radius: px(SHADOW_SPREAD),
+                    inset: false,
+                }])
+            });
         let words = words
             .child(
                 div()
@@ -453,7 +533,7 @@ impl Render for DesktopLyrics {
                     .font_weight(FontWeight::BOLD)
                     .text_size(px(text))
                     .line_height(px(text * 1.3))
-                    .text_center()
+                    .map(text_side)
                     .child(main),
             )
             .when_some(under.filter(|_| line.is_some()), |d, u| {
@@ -464,7 +544,7 @@ impl Render for DesktopLyrics {
                         .text_size(px(text * 0.62))
                         .line_height(px(text * 0.62 * 1.3))
                         .text_color(rgba(0xffffffb8))
-                        .text_center()
+                        .map(text_side)
                         .truncate()
                         .child(u),
                 )
@@ -481,7 +561,9 @@ impl Render for DesktopLyrics {
             .flex()
             .flex_col()
             .items_center()
-            .child(div().flex_1().w_full().pt(px(SHADOW)).flex().flex_col().items_center().justify_start().when(playing, |d| d.child(words)))
+            // Room on every side for the shadow; to one side, the words sit that close to
+            // the window's edge, so the window can be taken into a corner of the screen.
+            .child(div().flex_1().w_full().pt(px(SHADOW)).px(px(SHADOW)).flex().flex_col().map(side).justify_start().when(playing, |d| d.child(words)))
             .child(
                 div()
                     .h(px(CONTROLS))
@@ -580,6 +662,29 @@ impl DesktopLyrics {
                         this.app.update(cx, |app, cx| app.set_desktop_lyrics_backdrop(backdrop.next(), cx));
                     })),
             )
+            // Which side the words keep to: left, centre, right, round again.
+            .child({
+                let align = align();
+                div()
+                    .id("desk-align")
+                    .h(px(28.0))
+                    .pl(px(8.0))
+                    .pr(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(rgba(0x1414_14d0))
+                    .hover(|s| s.bg(rgba(0x3a3a_3af0)))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0xffffffcc))
+                    .child(div().font_family(ICONS).text_size(px(12.0)).child(align.glyph()))
+                    .child(align.name())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.app.update(cx, |app, cx| app.set_desktop_lyrics_align(align.next(), cx));
+                    }))
+            })
             .child(control("desk-smaller", "\u{E71F}").on_click(cx.listener(|this, _, _, cx| {
                 this.app.update(cx, |app, cx| app.resize_desktop_lyrics(-4.0, cx));
             })))
@@ -626,5 +731,9 @@ mod tests {
             assert_eq!(Backdrop::from_key(b.key()), Some(b));
         }
         assert_eq!(Backdrop::Dark.next(), Backdrop::None);
+        for a in Align::ALL {
+            assert_eq!(Align::from_key(a.key()), Some(a));
+        }
+        assert_eq!(Align::Right.next(), Align::Left);
     }
 }

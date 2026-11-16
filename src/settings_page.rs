@@ -1131,6 +1131,17 @@ impl NabyTune {
                     ),
                 ),
                 row(
+                    "Desktop lyrics alignment",
+                    t("Left or right keeps the words to one side, so they can sit in a corner of the screen"),
+                    self.segmented(
+                        "desk-align",
+                        crate::desktop_lyrics::Align::ALL.iter().map(|a| (*a, SharedString::from(a.name()))).collect(),
+                        crate::desktop_lyrics::align(),
+                        |this, align, _, cx| this.set_desktop_lyrics_align(align, cx),
+                        cx,
+                    ),
+                ),
+                row(
                     "Border round the desktop lyrics",
                     t("A thin line round the plate"),
                     switch("desk-border", crate::desktop_lyrics::bordered()).on_click(cx.listener(|this, _, _, cx| {

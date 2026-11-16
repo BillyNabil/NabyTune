@@ -286,7 +286,7 @@ impl NabyTune {
             .child(div().flex().child(self.back_button(cx)))
     }
 
-    pub(crate) fn artist_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn artist_page(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> AnyElement {
         let mut page = self.sub_page("artist-page", cx);
         let Some(view) = self.artist_view.as_ref() else { return page.into_any_element() };
         let photo = self.art.get("artist-photo").map(|a| a.small.clone()).filter(|_| view.page.is_some());
@@ -347,18 +347,23 @@ impl NabyTune {
             page = page.child(div().flex().flex_col().gap_3().child(Self::heading(t("Top songs"), 20.0)).child(list));
         }
         for (n, (title, cards)) in artist.shelves.iter().enumerate() {
-            let mut row = div().id(gpui::ElementId::NamedInteger("artist-shelf".into(), n as u64)).flex().gap_5().overflow_x_scroll().pb_2();
+            // Named by its first card too, so another artist's row starts at its start.
+            let key: SharedString = format!("artist-{n}-{}", cards.first().map(card_key).unwrap_or_default()).into();
+            let mut row = Vec::new();
             for (i, card) in cards.iter().cloned().enumerate() {
                 let id = gpui::ElementId::NamedInteger(format!("artist-card-{n}").into(), i as u64);
                 let art = self.art.get(&card_key(&card)).map(|a| a.small.clone());
                 let (title, subtitle): (SharedString, SharedString) = (card.title.clone().into(), card.subtitle.clone().into());
                 // Artists in a circle, as YouTube Music shows them.
                 let element = if youtube::is_artist(&card) { person_card(id, art, title, subtitle) } else { Self::card(id, art, title, subtitle, false) };
-                let element = element
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_card(card.clone(), cx)));
-                row = row.child(element);
+                let element = element.on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.shelf_dragged {
+                        this.open_card(card.clone(), cx);
+                    }
+                }));
+                row.push(element.into_any_element());
             }
-            page = page.child(div().flex().flex_col().gap_3().child(Self::heading(title.clone(), 20.0)).child(row));
+            page = page.child(self.shelf(key, Self::heading(title.clone(), 20.0), row, window, cx));
         }
         page.into_any_element()
     }

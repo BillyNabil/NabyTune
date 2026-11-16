@@ -40,6 +40,8 @@ mod player;
 mod stage;
 mod settings;
 mod settings_page;
+mod shelf;
+mod smooth_move;
 mod snapshot;
 mod stats;
 mod stats_page;
@@ -951,6 +953,10 @@ struct NabyTune {
     play_gesture: GestureState,
     prev_gesture: GestureState,
     next_gesture: GestureState,
+    /// Each sideways row's scroll, by the row's name.
+    shelves: HashMap<SharedString, shelf::Shelf>,
+    /// The last press dragged a row: it doesn't open the card it began on.
+    shelf_dragged: bool,
 }
 
 impl NabyTune {
@@ -1183,6 +1189,8 @@ impl NabyTune {
             play_gesture: GestureState::default(),
             prev_gesture: GestureState::default(),
             next_gesture: GestureState::default(),
+            shelves: HashMap::new(),
+            shelf_dragged: false,
         };
         appearance::set_accent(&app.accent_choice);
         appearance::set_follow_cover(match settings::get("accent_cover") {
@@ -1190,6 +1198,7 @@ impl NabyTune {
             None => settings::get("accent").is_some_and(|k| k == "cover"),
         });
         app.material.apply(window);
+        smooth_move::smooth_moves(window);
         // Listen again: what was played lately, once there is some.
         if !app.library.history.is_empty() {
             let recent: Vec<Track> = app.library.history.iter().take(8).map(Track::from).collect();
@@ -1276,7 +1285,7 @@ impl Render for NabyTune {
             Tab::Library => self.library_page(window, cx),
             Tab::Stats => self.stats_page(window, cx),
             Tab::Settings => self.settings_page(window, cx),
-            Tab::Artist => self.artist_page(cx),
+            Tab::Artist => self.artist_page(window, cx),
             Tab::Collection => self.collection_page(cx),
         };
         let setup = self.setup_overlay(window, cx);
