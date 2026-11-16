@@ -1,6 +1,6 @@
 [package]
 name = "nabytune-gpui-proto"
-version = "0.1.0"
+version = "0.1.1"
 description = "NabyTune: a native GPUI mini player, to judge animation and memory before moving the UI off WebView2"
 edition = "2021"
 license = "GPL-3.0-only"
