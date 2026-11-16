@@ -1,0 +1,49 @@
+[package]
+name = "nabytune-gpui-proto"
+version = "0.1.0"
+description = "NabyTune: a native GPUI mini player, to judge animation and memory before moving the UI off WebView2"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+# GPUI CE's platform backends (Windows: DirectX 11 + DirectWrite).
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0" }
+gpui-ce-motion = { version = "0.4", features = ["gpui"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+anyhow = "1"
+serde_json = "1"
+# InnerTube and googlevideo over HTTPS, from a worker thread.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "http2"] }
+# Output through WASAPI (cpal); decoded by symphonia, in pure Rust: AAC in MP4 (YouTube's itag 140),
+# and from lossless addons FLAC and ALAC (plain, or in MP4 from DASH/HLS), MP3, Ogg Vorbis and WAV.
+rodio = { version = "0.20", default-features = false }
+# Decoding is NabyTune's own (decoder.rs): rodio's probes a stream without its length, and
+# on YouTube's fragmented MP4 that never returns.
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4", "flac", "alac", "mp3", "ogg", "vorbis", "pcm", "wav"] }
+# Windows' media controls (SMTC): media keys, the volume flyout and the lock screen.
+souvlaki = "0.9"
+# KuGou sends its lyric files base64-encoded.
+base64 = "0.22"
+raw-window-handle = "0.6"
+# Windows' accent colour (registry) and the window material (DWM backdrop).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Registry", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }
+# Signing in to YouTube Music: Google's own page in a small WebView2 window (src/bin/naby-login.rs),
+# and the SAPISIDHASH its cookies sign requests with.
+wry = "0.57"
+tao = "0.37"
+sha1_smol = "1"
+# Lyrics in Latin letters, worked out here: Japanese through a morphological dictionary
+# (IPADIC, built in) for kanji readings, then kana to romaji; Chinese to pinyin.
+lindera = { version = "6.2", features = ["embed-ipadic"] }
+wana_kana = "5"
+pinyin = "0.11"
+# The listener's own music files: their tags, length and embedded covers (local_files.rs).
+lofty = "0.25"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
