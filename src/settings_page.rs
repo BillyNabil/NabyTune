@@ -1142,6 +1142,17 @@ impl NabyTune {
                     ),
                 ),
                 row(
+                    "Desktop lyrics opacity",
+                    t("They stay on top of every window; fainter words get in the way less"),
+                    self.segmented(
+                        "desk-opacity",
+                        crate::desktop_lyrics::OPACITIES.iter().map(|p| (*p, SharedString::from(format!("{p}%")))).collect(),
+                        crate::desktop_lyrics::opacity(),
+                        |this, percent, _, cx| this.set_desktop_lyrics_opacity(percent, cx),
+                        cx,
+                    ),
+                ),
+                row(
                     "Border round the desktop lyrics",
                     t("A thin line round the plate"),
                     switch("desk-border", crate::desktop_lyrics::bordered()).on_click(cx.listener(|this, _, _, cx| {

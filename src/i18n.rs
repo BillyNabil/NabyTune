@@ -447,6 +447,8 @@ const TABLE: &[(&str, &str)] = &[
     ("Drag the words to move them · Lock lets clicks pass through", "Geser liriknya untuk memindahkan · Kunci agar klik tembus"),
     ("Desktop lyrics alignment", "Posisi lirik di desktop"),
     ("Left or right keeps the words to one side, so they can sit in a corner of the screen", "Kiri atau kanan menaruh lirik di satu sisi, jadi bisa ditaruh di pojok layar"),
+    ("Desktop lyrics opacity", "Transparansi lirik di desktop"),
+    ("They stay on top of every window; fainter words get in the way less", "Lirik selalu di atas semua window; makin transparan, makin tidak mengganggu"),
     ("Left", "Kiri"),
     ("Right", "Kanan"),
     // Settings › Windows and Discord

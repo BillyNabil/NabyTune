@@ -163,6 +163,20 @@ const UNLOCK_WIDTH: f32 = 112.0;
 
 pub(crate) type DesktopLyricsHandle = WindowHandle<DesktopLyrics>;
 
+/// How solid the words (and their plate or shadow) are, in percent: the steps offered. The
+/// window stays on top of everything, so fainter words get in the way less.
+pub(crate) const OPACITIES: [u8; 5] = [100, 80, 60, 40, 25];
+
+/// The words' opacity, in percent, as kept.
+pub(crate) fn opacity() -> u8 {
+    settings::get("desk_lyrics_opacity").and_then(|v| v.parse().ok()).unwrap_or(100).clamp(10, 100)
+}
+
+/// The next step down, and from the faintest back to solid.
+fn next_opacity(percent: u8) -> u8 {
+    OPACITIES.iter().copied().find(|&step| step < percent).unwrap_or(100)
+}
+
 /// The words' size, as kept.
 pub(crate) fn text_size() -> f32 {
     settings::get("desk_lyrics_size").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SIZE).clamp(SMALLEST, LARGEST)
@@ -297,6 +311,12 @@ impl NabyTune {
     /// Which side of the window the words keep to.
     pub(crate) fn set_desktop_lyrics_align(&mut self, align: Align, cx: &mut Context<Self>) {
         settings::set("desk_lyrics_align", align.key());
+        cx.notify();
+    }
+
+    /// How solid the words are, in percent.
+    pub(crate) fn set_desktop_lyrics_opacity(&mut self, percent: u8, cx: &mut Context<Self>) {
+        settings::set("desk_lyrics_opacity", &percent.clamp(10, 100).to_string());
         cx.notify();
     }
 
@@ -553,6 +573,9 @@ impl Render for DesktopLyrics {
         // their own row under them, out of the drag area, so they stay buttons. The words are
         // at the window's top, so they can be taken right up to the top of the screen (Windows
         // stops a window's drag area there, not its edge).
+        // Fainter when the listener wants them so; the buttons under them stay solid.
+        let faded = opacity();
+        let words = words.when(faded < 100, |d| d.opacity(faded as f32 / 100.0));
         let words = words.id("desk-words").when(!locked, |d| d.window_control_area(WindowControlArea::Drag));
         div()
             .id("desk-lyrics")
@@ -685,6 +708,29 @@ impl DesktopLyrics {
                         this.app.update(cx, |app, cx| app.set_desktop_lyrics_align(align.next(), cx));
                     }))
             })
+            // How solid the words are: a step fainter each click, then solid again.
+            .child({
+                let percent = opacity();
+                div()
+                    .id("desk-opacity")
+                    .h(px(28.0))
+                    .pl(px(8.0))
+                    .pr(px(10.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(rgba(0x1414_14d0))
+                    .hover(|s| s.bg(rgba(0x3a3a_3af0)))
+                    .text_size(px(11.0))
+                    .text_color(rgba(0xffffffcc))
+                    .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E706}"))
+                    .child(format!("{percent}%"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.app.update(cx, |app, cx| app.set_desktop_lyrics_opacity(next_opacity(percent), cx));
+                    }))
+            })
             .child(control("desk-smaller", "\u{E71F}").on_click(cx.listener(|this, _, _, cx| {
                 this.app.update(cx, |app, cx| app.resize_desktop_lyrics(-4.0, cx));
             })))
@@ -735,5 +781,14 @@ mod tests {
             assert_eq!(Align::from_key(a.key()), Some(a));
         }
         assert_eq!(Align::Right.next(), Align::Left);
+    }
+
+    #[test]
+    fn opacity_steps_down_then_back_to_solid() {
+        assert_eq!(next_opacity(100), 80);
+        assert_eq!(next_opacity(40), 25);
+        assert_eq!(next_opacity(25), 100);
+        // A value between steps (kept from a hand-edited setting) goes to the next one under it.
+        assert_eq!(next_opacity(70), 60);
     }
 }

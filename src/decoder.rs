@@ -31,9 +31,32 @@ pub struct AudioSource {
     duration: Option<Duration>,
 }
 
+/// A track's encoded bytes, shared: the playing decoder reads them, and the audio engine keeps
+/// a hold on them to start the track again on another output device.
+#[derive(Clone)]
+pub struct Bytes(std::sync::Arc<Vec<u8>>);
+
+impl Bytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(bytes))
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl AudioSource {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, String> {
-        let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    pub fn new(bytes: impl Into<Bytes>) -> Result<Self, String> {
+        let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes.into())), Default::default());
         // No hint: the bytes say what they are ("ftyp", "fLaC", "OggS", "ID3"…).
         let hint = Hint::new();
         let probed = symphonia::default::get_probe()
