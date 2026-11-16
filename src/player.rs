@@ -248,6 +248,7 @@ impl NabyTune {
         self.loading = false;
         match result {
             Ok(loaded) => {
+                self.failed_in_row = 0;
                 if loaded.cover.is_some() {
                     self.cover = loaded.cover;
                     self.cover_large = loaded.cover_large;
@@ -292,6 +293,21 @@ impl NabyTune {
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 self.lyrics = Lyrics::Idle;
+                // A song that won't play doesn't stop the music: the next one starts after a
+                // moment (time enough to read why). A run of them stops it, as it would loop.
+                self.failed_in_row += 1;
+                let has_next = self.next_index().is_some();
+                if self.playing && has_next && self.failed_in_row <= 5 {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_millis(2500)).await;
+                        let _ = this.update(cx, |app, cx| {
+                            if app.generation == generation && app.error.is_some() {
+                                app.skip(1, cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
             }
         }
         cx.notify();

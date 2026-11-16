@@ -55,6 +55,14 @@ foreach ($f in $app, $login) {
     if (-not (Test-Path $f)) { throw "missing $f (build gpui-proto in release first, or drop -SkipAppBuild)" }
 }
 
+# 1b. The app must not carry this machine's project folder: anything it reads from there at run
+#     time works here and nowhere else (0.1.0 read its seed songs from it, and wouldn't start).
+foreach ($f in $app, $login) {
+    if (Select-String -Path $f -Pattern $root -SimpleMatch -Quiet) {
+        throw "$f contains the build folder ($root): something reads a build-time path at run time"
+    }
+}
+
 # 2. Payload.
 if (Test-Path $payload) { Remove-Item -Recurse -Force $payload }
 New-Item -ItemType Directory -Force $payload | Out-Null

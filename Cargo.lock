@@ -4319,6 +4319,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest",
  "rodio",
+ "roxmltree 0.20.0",
  "serde_json",
  "sha1_smol",
  "souvlaki",

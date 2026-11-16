@@ -14,6 +14,29 @@ use serde_json::{json, Value};
 const VISIONOS_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const WEB_REMIX_VERSION: &str = "1.20251020.01.00";
+
+/// A client YouTube's player is asked as: its name, number and version, the user agent its
+/// streams are then fetched with, and what else its context carries.
+pub struct PlayerClient {
+    name: &'static str,
+    id: &'static str,
+    version: &'static str,
+    user_agent: &'static str,
+    context: fn() -> Value,
+}
+
+/// The clients a song's stream is asked from, in turn; each must hand out plain stream URLs
+/// (no signature to work out) that play to the end. (ANDROID_VR answers, but its streams are
+/// refused past the first megabyte without a proof-of-origin token.)
+const PLAYER_CLIENTS: [PlayerClient; 1] = [
+    PlayerClient {
+        name: "VISIONOS",
+        id: "101",
+        version: "1.02",
+        user_agent: VISIONOS_UA,
+        context: || json!({ "deviceMake": "Apple", "deviceModel": "RealityDevice17,1", "osName": "visionOS", "osVersion": "26.5.23O471" }),
+    },
+];
 const CHUNK: u64 = 1024 * 1024;
 
 /// One song from a YouTube Music search.
@@ -358,6 +381,8 @@ pub struct Stream {
     pub length: Duration,
     /// How much louder than YouTube's reference the track is; NabyTune turns it down by as much.
     pub loudness_db: f32,
+    /// What the stream is fetched as: the client that was given it.
+    pub user_agent: &'static str,
 }
 
 pub struct YouTube {
@@ -460,26 +485,39 @@ impl YouTube {
     }
 
     /// VISIONOS's player response for `video_id`, and its AAC stream (itag 140, else 139).
+    /// A song's audio stream. YouTube's player answers differently by client: a video one
+    /// client is told is "not available" another can often play, so each is tried in turn.
     pub fn resolve(&self, video_id: &str) -> Result<Stream> {
         let visitor = self.visitor_data()?;
+        let mut failed = Vec::new();
+        // NABYTUNE_PROTO_PLAYER=<client name>: only that client, to try one on its own.
+        let only = std::env::var("NABYTUNE_PROTO_PLAYER").ok();
+        for client in PLAYER_CLIENTS.iter().filter(|c| only.as_deref().is_none_or(|n| n == c.name)) {
+            match self.resolve_as(client, video_id, &visitor) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    crate::audio::log(format!("resolve {video_id} as {}: {e:#}", client.name));
+                    failed.push(e);
+                }
+            }
+        }
+        // The first client's answer says it best ("This video is not available", ...).
+        Err(failed.into_iter().next().unwrap_or_else(|| anyhow!("no player client")))
+    }
+
+    fn resolve_as(&self, client: &PlayerClient, video_id: &str, visitor: &str) -> Result<Stream> {
+        let mut context = json!({ "clientName": client.name, "clientVersion": client.version, "hl": "en", "visitorData": visitor });
+        if let (Some(target), Some(extra)) = (context.as_object_mut(), (client.context)().as_object().cloned()) {
+            target.extend(extra);
+        }
         let player: Value = self
             .http
             .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-            .header("user-agent", VISIONOS_UA)
-            .header("x-youtube-client-name", "101")
-            .header("x-youtube-client-version", "1.02")
-            .header("x-goog-visitor-id", &visitor)
-            .json(&json!({
-                "context": { "client": {
-                    "clientName": "VISIONOS", "clientVersion": "1.02",
-                    "deviceMake": "Apple", "deviceModel": "RealityDevice17,1",
-                    "osName": "visionOS", "osVersion": "26.5.23O471",
-                    "hl": "en", "visitorData": visitor,
-                } },
-                "videoId": video_id,
-                "contentCheckOk": true,
-                "racyCheckOk": true,
-            }))
+            .header("user-agent", client.user_agent)
+            .header("x-youtube-client-name", client.id)
+            .header("x-youtube-client-version", client.version)
+            .header("x-goog-visitor-id", visitor)
+            .json(&json!({ "context": { "client": context }, "videoId": video_id, "contentCheckOk": true, "racyCheckOk": true }))
             .send()?
             .error_for_status()?
             .json()?;
@@ -501,6 +539,7 @@ impl YouTube {
             content_length,
             length: Duration::from_secs(length),
             loudness_db: player["playerConfig"]["audioConfig"]["loudnessDb"].as_f64().unwrap_or(0.0) as f32,
+            user_agent: client.user_agent,
         })
     }
 
@@ -1029,7 +1068,7 @@ impl YouTube {
             .filter(|l| !l.is_empty())
             .map(|l| crate::lyrics::Line::new(Duration::ZERO, l.to_string()))
             .collect();
-        Ok((!lines.is_empty()).then_some(crate::lyrics::Found { lines, synced: false, source: "YouTube Music" }))
+        Ok((!lines.is_empty()).then_some(crate::lyrics::Found { lines, synced: false, source: "YouTube Music", length: None }))
     }
 
 
@@ -1064,7 +1103,7 @@ impl YouTube {
             let chunk = self
                 .http
                 .get(format!("{}&range={start}-{end}", stream.url))
-                .header("user-agent", VISIONOS_UA)
+                .header("user-agent", stream.user_agent)
                 .send()?
                 .error_for_status()
                 .with_context(|| format!("googlevideo refused bytes {start}-{end}"))?

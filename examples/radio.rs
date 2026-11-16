@@ -5,6 +5,9 @@
 #[path = "../src/account.rs"]
 #[allow(dead_code)]
 mod account;
+#[path = "../src/lyrics_sources.rs"]
+#[allow(dead_code)]
+mod lyrics_sources;
 #[path = "../src/lyrics.rs"]
 #[allow(dead_code)]
 mod lyrics;

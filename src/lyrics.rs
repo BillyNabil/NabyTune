@@ -1,12 +1,15 @@
-//! Synced lyrics, from the same providers NabyTune's web player asks
-//! (web/app/src/lyrics/providers.ts), in its priority order:
+//! Synced lyrics, asked of the providers BitChord asks, in its order, and picked as it picks:
 //!
-//! 1. LyricsPlus: Apple Music timings syllable by syllable, on community mirrors.
-//! 2. LRCLIB: whole lines, always up.
-//! 3. KuGou: whole lines, strong outside the English catalogue (Japanese, Chinese, Korean).
+//! 1. lrc.red, 2. BiniLyrics, 3. BetterLyrics, 4. BetterLyrics Portato: word-by-word timings
+//!    (Apple's TTML, QQ Music's karaoke lines), in lyrics_sources.rs.
+//! 5. LyricsPlus: Apple Music timings syllable by syllable, on community mirrors.
+//! 6. Unison: community-voted, word or line timings.
+//! 7. KuGou: whole lines, strong outside the English catalogue (Japanese, Chinese, Korean).
+//! 8. LRCLIB: whole lines, always up.
 //!
-//! The three are asked at once; the best one that answers wins. YouTube Music's own,
-//! unsynced lyrics are the last resort (youtube.rs).
+//! All are asked at once; the answers are taken in that order, so the first source (by
+//! priority, not speed) with timed lines wins. YouTube Music's own unsynced lyrics are the
+//! last resort (youtube.rs).
 
 use std::time::Duration;
 
@@ -59,16 +62,40 @@ pub fn timed(lines: &[Line], secs: u64) -> bool {
     !(secs >= 60 && sung.len() >= 8 && span < secs as f64 * 0.3)
 }
 
-/// Lyrics as found: their lines, whether they're timed, and who had them.
+/// Lyrics as found: their lines, whether they're timed, who had them, and how long the
+/// recording they were timed to is (when the source says).
 #[derive(Clone, Debug)]
 pub struct Found {
     pub lines: Vec<Line>,
     pub synced: bool,
     pub source: &'static str,
+    pub length: Option<Duration>,
 }
 
-const AGENT: &str = "NabyTune prototype (https://github.com/BillyNabil)";
-const LYRICSPLUS_MIRRORS: [&str; 2] = ["https://lyricsplus.binimum.org", "https://lyricsplus.prjktla.my.id"];
+/// Lines and the length of the recording they're timed to, as a source answers.
+type Timed = (Vec<Line>, Option<Duration>);
+
+/// A length in seconds (LRCLIB's 215.0, KuGou's 215), when there is one.
+fn seconds(v: &Value) -> Option<Duration> {
+    v.as_f64().filter(|s| *s > 0.0).map(Duration::from_secs_f64)
+}
+
+/// "3:21.570" (LyricsPlus's totalDuration) as a length.
+fn clock_length(text: &str) -> Option<Duration> {
+    let (m, s) = text.split_once(':')?;
+    Some(Duration::from_secs_f64(m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?))
+}
+
+const AGENT: &str = "NabyTune (https://github.com/BillyNabil/NabyTune)";
+/// LyricsPlus's mirrors, all asked at once (the first good answer wins).
+const LYRICSPLUS_MIRRORS: [&str; 6] = [
+    "https://lyricsplus.prjktla.my.id",
+    "https://lyricsplus.atomix.one",
+    "https://lyricsplus.binimum.org",
+    "https://lyricsplus.prjktla.workers.dev",
+    "https://lyricsplus-seven.vercel.app",
+    "https://lyrics-plus-backend.vercel.app",
+];
 
 /// "(feat. …)", "(Official Video)", "[…]" and the like, which lyric databases' titles don't carry.
 pub(crate) fn clean(s: &str) -> String {
@@ -121,20 +148,20 @@ fn get_json(http: &reqwest::blocking::Client, url: &str, query: &[(&str, String)
     Ok(response.error_for_status()?.json()?)
 }
 
-fn lrclib(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Vec<Line>> {
+fn lrclib(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Timed> {
     let t = Duration::from_secs(8);
     // Anyone can upload to LRCLIB, so an entry is taken only if its timings hold up.
     let usable = |lrc: Option<&str>| lrc.filter(|s| !s.trim().is_empty()).map(parse_lrc).filter(|lines| timed(lines, secs));
     let exact = get_json(http, "https://lrclib.net/api/get", &[("track_name", title.into()), ("artist_name", artist.into()), ("duration", secs.to_string())], t).ok()?;
     if let Some(lines) = usable(exact["syncedLyrics"].as_str()) {
-        return Some(lines);
+        return Some((lines, seconds(&exact["duration"])));
     }
     // The closest-length hit with usable timings, within 10 s.
-    let pick = |hits: &Value| -> Option<Vec<Line>> {
+    let pick = |hits: &Value| -> Option<Timed> {
         let mut hits: Vec<(&Value, f64)> =
             hits.as_array()?.iter().map(|h| (h, (h["duration"].as_f64().unwrap_or(0.0) - secs as f64).abs())).filter(|(_, off)| *off <= 10.0).collect();
         hits.sort_by(|a, b| a.1.total_cmp(&b.1));
-        hits.into_iter().find_map(|(h, _)| usable(h["syncedLyrics"].as_str()))
+        hits.into_iter().find_map(|(h, _)| usable(h["syncedLyrics"].as_str()).map(|lines| (lines, seconds(&h["duration"]))))
     };
     let hits = get_json(http, "https://lrclib.net/api/search", &[("track_name", title.into()), ("artist_name", artist.into())], t).ok()?;
     if let Some(lines) = pick(&hits) {
@@ -177,46 +204,44 @@ fn words_of(syllables: &[Value]) -> Vec<Word> {
     words
 }
 
-/// LyricsPlus: lines with syllable timings; the line starts at its first syllable.
-fn lyricsplus(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Vec<Line>> {
+/// LyricsPlus: lines with syllable timings; the line starts at its first syllable. Every
+/// mirror is asked at once and the first to answer with lines wins.
+fn lyricsplus(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Timed> {
+    let (tx, rx) = std::sync::mpsc::channel();
     for host in LYRICSPLUS_MIRRORS {
-        let Ok(body) = get_json(
-            http,
-            &format!("{host}/v2/lyrics/get"),
-            &[("title", title.into()), ("artist", artist.into()), ("duration", secs.to_string())],
-            Duration::from_secs(7),
-        ) else {
-            continue;
-        };
-        let mut lines: Vec<Line> = body["lyrics"]
-            .as_array()
-            .map(|lyrics| {
-                lyrics
-                    .iter()
-                    .filter_map(|l| {
-                        let time = l["time"].as_f64()?;
-                        let syllables: String = l["syllabus"]
-                            .as_array()
-                            .map(|s| s.iter().filter_map(|x| x["text"].as_str()).collect())
-                            .unwrap_or_default();
-                        let text = if syllables.trim().is_empty() { l["text"].as_str().unwrap_or("").to_string() } else { syllables };
-                        let start = l["syllabus"][0]["time"].as_f64().map_or(time, |s| s.min(time));
-                        let words = l["syllabus"].as_array().map(|s| words_of(s)).unwrap_or_default();
-                        Some(Line {
-                            at: Duration::from_secs_f64(start.max(0.0) / 1000.0),
-                            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
-                            words,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        lines.sort_by_key(|l| l.at);
-        if lines.iter().any(|l| !l.text.is_empty()) {
-            return Some(lines);
-        }
+        let (tx, http, title, artist) = (tx.clone(), http.clone(), title.to_string(), artist.to_string());
+        std::thread::spawn(move || {
+            let answer = get_json(
+                &http,
+                &format!("{host}/v2/lyrics/get"),
+                &[("title", title), ("artist", artist), ("duration", secs.to_string())],
+                Duration::from_secs(7),
+            )
+            .ok()
+            .and_then(|body| lyricsplus_lines(&body));
+            let _ = tx.send(answer);
+        });
     }
-    None
+    drop(tx);
+    rx.iter().flatten().next()
+}
+
+fn lyricsplus_lines(body: &Value) -> Option<Timed> {
+    let mut lines: Vec<Line> = body["lyrics"]
+        .as_array()?
+        .iter()
+        .filter_map(|l| {
+            let time = l["time"].as_f64()?;
+            let syllables: String =
+                l["syllabus"].as_array().map(|s| s.iter().filter_map(|x| x["text"].as_str()).collect()).unwrap_or_default();
+            let text = if syllables.trim().is_empty() { l["text"].as_str().unwrap_or("").to_string() } else { syllables };
+            let start = l["syllabus"][0]["time"].as_f64().map_or(time, |s| s.min(time));
+            let words = l["syllabus"].as_array().map(|s| words_of(s)).unwrap_or_default();
+            Some(Line { at: Duration::from_secs_f64(start.max(0.0) / 1000.0), text: text.split_whitespace().collect::<Vec<_>>().join(" "), words })
+        })
+        .collect();
+    lines.sort_by_key(|l| l.at);
+    lines.iter().any(|l| !l.text.is_empty()).then(|| (lines, body["metadata"]["totalDuration"].as_str().and_then(clock_length)))
 }
 
 /// Whether two artist credits name the same artist: one inside the other, or a shared word
@@ -247,7 +272,7 @@ fn strip_kugou_credits(lrc: &str) -> String {
     body[..body.len() - tail.min(body.len())].join("\n")
 }
 
-fn kugou(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Vec<Line>> {
+fn kugou(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64) -> Option<Timed> {
     let t = Duration::from_secs(8);
     let keyword = format!("{title} - {artist}");
     let songs = get_json(
@@ -273,14 +298,15 @@ fn kugou(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64)
         })
         .unwrap_or_default();
     hashes.sort();
-    let search = |query: &[(&str, String)]| -> Option<(String, String)> {
+    let search = |query: &[(&str, String)]| -> Option<(String, String, Option<Duration>)> {
         let found = get_json(http, "https://lyrics.kugou.com/search", query, t).ok()?;
         let c = &found["candidates"][0];
         // A keyword search can land on anyone's song of that name: check whose it is.
         if c["singer"].as_str().is_some_and(|singer| !same_artist(singer, artist)) {
             return None;
         }
-        Some((c["id"].as_str()?.to_string(), c["accesskey"].as_str()?.to_string()))
+        let length = c["duration"].as_f64().filter(|ms| *ms > 0.0).map(|ms| Duration::from_secs_f64(ms / 1000.0));
+        Some((c["id"].as_str()?.to_string(), c["accesskey"].as_str()?.to_string(), length))
     };
     let base = || vec![("ver", "1".to_string()), ("man", "yes".to_string()), ("client", "pc".to_string())];
     let candidate = hashes
@@ -308,24 +334,72 @@ fn kugou(http: &reqwest::blocking::Client, title: &str, artist: &str, secs: u64)
     if lines.iter().all(|l| l.text.is_empty() || (l.text.contains("纯音乐") && l.text.contains("欣赏"))) {
         return None;
     }
-    Some(lines)
+    Some((lines, candidate.2))
 }
 
-/// The three synced sources at once: every one whose lines are really timed, best first
-/// (LyricsPlus, LRCLIB, KuGou). The first is shown; the rest can be picked instead.
+/// Every source at once, BitChord's way: the answers are taken in priority order (a
+/// faster source lower down can't jump a slower one above it), and the first with timed
+/// lines wins; word-timed sources are the first ones asked. What else has answered by
+/// then follows it, for the listener to pick instead.
 pub fn fetch(http: &reqwest::blocking::Client, title: &str, artist: &str, length: Duration) -> Vec<Found> {
     let (title, artist) = (clean(title), clean(artist));
     let secs = length.as_secs();
-    let (plus, lrc, kg) = std::thread::scope(|s| {
-        let plus = s.spawn(|| lyricsplus(http, &title, &artist, secs));
-        let lrc = s.spawn(|| lrclib(http, &title, &artist, secs));
-        let kg = s.spawn(|| kugou(http, &title, &artist, secs));
-        (plus.join().ok().flatten(), lrc.join().ok().flatten(), kg.join().ok().flatten())
-    });
-    [(plus, "LyricsPlus"), (lrc, "LRCLIB"), (kg, "KuGou")]
-        .into_iter()
-        .filter_map(|(lines, source)| lines.filter(|l| timed(l, secs)).map(|lines| Found { lines: one_per_time(lines), synced: true, source }))
-        .collect()
+    type Ask = fn(&reqwest::blocking::Client, &str, &str, u64) -> Option<Timed>;
+    const ASK: [(&str, Ask); 8] = [
+        ("lrc.red", crate::lyrics_sources::lrc_red),
+        ("BiniLyrics", crate::lyrics_sources::bini_lyrics),
+        ("BetterLyrics", |h, t, a, s| crate::lyrics_sources::better_lyrics(h, t, a, s, false)),
+        ("BetterLyrics Portato", |h, t, a, s| crate::lyrics_sources::better_lyrics(h, t, a, s, true)),
+        ("LyricsPlus", lyricsplus),
+        ("Unison", crate::lyrics_sources::unison),
+        ("KuGou", kugou),
+        ("LRCLIB", lrclib),
+    ];
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, (_, ask)) in ASK.iter().enumerate() {
+        let (tx, http, title, artist, ask) = (tx.clone(), http.clone(), title.clone(), artist.clone(), *ask);
+        std::thread::spawn(move || {
+            let _ = tx.send((i, ask(&http, &title, &artist, secs)));
+        });
+    }
+    drop(tx);
+    // Each source's answer as it comes: None while it's still out.
+    let mut answers: Vec<Option<Option<Found>>> = vec![None; ASK.len()];
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let winner = loop {
+        // The first source, in order, that has answered with timed lines, once every one
+        // above it has answered (with nothing).
+        let mut decided = None;
+        for (i, answer) in answers.iter().enumerate() {
+            match answer {
+                None => break,
+                Some(Some(_)) => {
+                    decided = Some(i);
+                    break;
+                }
+                Some(None) => {}
+            }
+        }
+        if decided.is_some() || answers.iter().all(Option::is_some) {
+            break decided;
+        }
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok((i, hit)) => {
+                answers[i] = Some(hit.and_then(|(lines, len)| {
+                    timed(&lines, secs).then(|| Found { lines: one_per_time(lines), synced: true, source: ASK[i].0, length: len })
+                }));
+            }
+            // Out of time, or every source done: the best of what came.
+            Err(_) => break answers.iter().position(|a| matches!(a, Some(Some(_)))),
+        }
+    };
+    let mut found: Vec<Found> = Vec::new();
+    if let Some(w) = winner {
+        found.extend(answers[w].take().flatten());
+    }
+    found.extend(answers.into_iter().flatten().flatten());
+    found
 }
 
 /// Japanese, Chinese or Korean letters in it.
@@ -419,6 +493,11 @@ mod tests {
     }
 
     #[test]
+    fn reads_lyric_lengths() {
+        assert_eq!(clock_length("3:21.570"), Some(Duration::from_millis(201_570)));
+    }
+
+    #[test]
     fn cleans_titles() {
         assert_eq!(clean("Stay Alive (From \"Re:Zero\")"), "Stay Alive");
         assert_eq!(clean("エミリア（CV:高橋李依）"), "エミリア");
@@ -445,7 +524,7 @@ mod tests {
 // ---- Kept on disk ------------------------------------------------------------------------
 
 /// Every source a cached version can name (cached versions come back with these).
-const SOURCES: [&str; 4] = ["LyricsPlus", "LRCLIB", "KuGou", "YouTube Music"];
+const SOURCES: [&str; 9] = ["lrc.red", "BiniLyrics", "BetterLyrics", "BetterLyrics Portato", "LyricsPlus", "Unison", "LRCLIB", "KuGou", "YouTube Music"];
 
 /// How long found lyrics are kept before they're asked for again.
 const KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
@@ -469,6 +548,10 @@ pub fn cached(video_id: &str) -> Option<Vec<Found>> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    // Kept before BitChord's sources were asked: found again.
+    if v["format"].as_u64().unwrap_or(1) < 3 {
+        return None;
+    }
     let at = |v: &serde_json::Value, k: &str| Duration::from_millis(v[k].as_u64().unwrap_or(0));
     v["versions"]
         .as_array()?
@@ -487,7 +570,8 @@ pub fn cached(video_id: &str) -> Option<Vec<Found>> {
                         .unwrap_or_default(),
                 })
                 .collect();
-            Some(Found { lines, synced: f["synced"].as_bool().unwrap_or(false), source })
+            let length = f["length_ms"].as_u64().map(Duration::from_millis);
+            Some(Found { lines, synced: f["synced"].as_bool().unwrap_or(false), source, length })
         })
         .collect()
 }
@@ -501,6 +585,7 @@ pub fn keep(video_id: &str, found: &[Found]) {
             serde_json::json!({
                 "source": f.source,
                 "synced": f.synced,
+                "length_ms": f.length.map(ms),
                 "lines": f.lines.iter().map(|l| serde_json::json!({
                     "at": ms(l.at),
                     "text": l.text,
@@ -512,5 +597,5 @@ pub fn keep(video_id: &str, found: &[Found]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, serde_json::json!({ "versions": versions }).to_string());
+    let _ = std::fs::write(path, serde_json::json!({ "format": 3, "versions": versions }).to_string());
 }

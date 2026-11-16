@@ -12,5 +12,10 @@ NabyTune is free software under the same licence, the GNU General Public License
 BitChord's own credits, for the projects and lyrics providers it builds on, are in its
 README and stay with its source.
 
+Lyrics come from the providers BitChord asks, in its order: [lrc.red](https://lrc.red),
+BiniLyrics, [BetterLyrics](https://github.com/better-lyrics/better-lyrics),
+[LyricsPlus](https://github.com/ibratabian17/YouLyPlus), [Unison](https://unison.boidu.dev),
+[KuGou](https://www.kugou.com), [LRCLIB](https://lrclib.net) and YouTube Music.
+
 NabyTune also uses open-source Rust libraries (GPUI, rodio, symphonia, lindera, reqwest and
 others); their licences come with their crates (see `Cargo.lock` for the full list).

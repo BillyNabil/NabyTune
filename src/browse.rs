@@ -610,7 +610,8 @@ impl NabyTune {
             .flex_col()
             .gap_6()
             .child(Self::heading(t("Home"), 30.0))
-            .child(div().flex().flex_col().gap_3().child(Self::heading(t("Played lately"), 20.0)).child(again));
+            // Nothing played yet (a fresh install): no empty shelf.
+            .when(!seeds.is_empty(), |d| d.child(div().flex().flex_col().gap_3().child(Self::heading(t("Played lately"), 20.0)).child(again)));
 
         // Songs like the ones played lately.
         if !self.recommended.is_empty() {

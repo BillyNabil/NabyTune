@@ -24,6 +24,7 @@ mod library_page;
 mod local;
 mod local_files;
 mod lyrics;
+mod lyrics_sources;
 mod media;
 mod mini;
 mod discord;
@@ -56,7 +57,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context as _;
 use appearance::{accent, accent_wash, on_accent, Material};
 use gpui::{
     actions, deferred, div, img, prelude::*, AnimationExt as _, px, relative, rgb, rgba, size, AnyElement, App, Bounds, Context, Entity, FocusHandle,
@@ -491,11 +491,46 @@ fn fetch_loaded(youtube: &youtube::YouTube, request: &LoadRequest) -> anyhow::Re
             Err(e) => audio::log(format!("lossless: {} failed: {e:#}", addon.name)),
         }
     }
-    let stream = youtube.resolve(&request.video_id)?;
+    let (stream, stand_in) = match youtube.resolve(&request.video_id) {
+        Ok(stream) => (stream, false),
+        // Not playable here (taken down, blocked in this country, or refused to this player):
+        // the same song from another upload, when YouTube Music has one.
+        Err(e) => match stand_in(youtube, request) {
+            Some(stream) => (stream, true),
+            None => return Err(e),
+        },
+    };
     let bytes = youtube.download(&stream)?;
     // YouTube's loudness normalisation: louder-than-reference tracks are turned down.
     let volume = 10f32.powf(-stream.loudness_db.max(0.0) / 20.0);
-    anyhow::Ok(Loaded { bytes, length: stream.length, volume, cover, cover_large, quality: "AAC 128 kbps".into(), lossless_from: None, big })
+    let quality: SharedString = if stand_in { t("AAC 128 kbps · another upload").into() } else { "AAC 128 kbps".into() };
+    anyhow::Ok(Loaded { bytes, length: stream.length, volume, cover, cover_large, quality, lossless_from: None, big })
+}
+
+/// Another upload of the song `request` names, when its own won't play: YouTube Music's search
+/// for its title and artist, taking the first result that is the same song (its title in the
+/// result's, the artist too, and as long within 20 seconds when both lengths are known).
+fn stand_in(youtube: &youtube::YouTube, request: &LoadRequest) -> Option<youtube::Stream> {
+    let fold = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>();
+    let (title, artist) = (fold(&request.title), fold(&request.artist));
+    let first_artist = artist.split_whitespace().next().unwrap_or("").to_string();
+    let results = youtube.search(&format!("{} {}", request.title, request.artist)).ok()?;
+    for item in results.iter().filter(|i| i.video_id != request.video_id).take(6) {
+        let same_title = fold(&item.title).contains(title.trim()) || title.contains(fold(&item.title).trim());
+        let same_artist = first_artist.is_empty() || fold(&item.artist).contains(&first_artist) || fold(&item.title).contains(&first_artist);
+        let close = match (request.seconds, clock_seconds(&item.duration)) {
+            (Some(a), Some(b)) => (a - b).abs() <= 20.0,
+            _ => true,
+        };
+        if !(same_title && same_artist && close) {
+            continue;
+        }
+        if let Ok(stream) = youtube.resolve(&item.video_id) {
+            audio::log(format!("stand-in: \"{}\" ({}) plays as {} ({})", request.title, request.video_id, item.video_id, item.title));
+            return Some(stream);
+        }
+    }
+    None
 }
 
 /// What fetching a track takes.
@@ -738,6 +773,8 @@ struct NabyTune {
     /// starts with the first frame drawn closing (`stage_close_drawn`), so a slow frame
     /// can't eat the start of the slide.
     stage_closing: Option<Instant>,
+    /// Songs in a row that couldn't be played: past a few, it stops skipping on to the next.
+    failed_in_row: u32,
     stage_close_drawn: bool,
     stage_motion: MotionState,
     stage_cover_motion: MotionState,
@@ -1040,6 +1077,7 @@ impl NabyTune {
             stage_volume_open: false,
             stage_volume_closed: Instant::now(),
             stage_closing: None,
+            failed_in_row: 0,
             stage_close_drawn: false,
             stage_motion: MotionState::default(),
             stage_cover_motion: MotionState::default(),
@@ -1388,29 +1426,85 @@ impl Render for NabyTune {
     }
 }
 
-fn load_seeds() -> anyhow::Result<Vec<Track>> {
-    let dir = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("covers"));
-    let list = std::fs::read_to_string(dir.join("tracks.txt")).with_context(|| format!("reading {}", dir.join("tracks.txt").display()))?;
+/// Songs to start with, for development only: `NABYTUNE_PROTO_SEEDS` names a folder holding
+/// `tracks.txt` (`cover|title|artist|videoId` per line) and the covers. Anything missing or
+/// malformed is skipped: an installed NabyTune starts with none, and that's the normal case.
+fn load_seeds() -> Vec<Track> {
+    let Some(dir) = std::env::var_os("NABYTUNE_PROTO_SEEDS").map(PathBuf::from) else { return Vec::new() };
+    let Ok(list) = std::fs::read_to_string(dir.join("tracks.txt")) else { return Vec::new() };
     list.lines()
         .map(|line| line.trim_start_matches('\u{feff}'))
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
+        .filter_map(|line| {
             let parts: Vec<&str> = line.split('|').collect();
-            anyhow::ensure!(parts.len() == 4, "bad line: {line}");
-            Ok(Track {
+            if parts.len() != 4 {
+                audio::log(format!("seeds: skipped a bad line: {line}"));
+                return None;
+            }
+            let cover = image::open(dir.join(parts[0])).ok()?.to_rgba8();
+            Some(Track {
                 video_id: parts[3].trim().to_string(),
                 title: parts[1].to_string().into(),
                 artist: parts[2].to_string().into(),
                 detail: parts[2].to_string().into(),
                 duration: SharedString::default(),
                 thumbnail: None,
-                local: Some(Arc::new(image::open(dir.join(parts[0]))?.to_rgba8())),
+                local: Some(Arc::new(cover)),
             })
         })
         .collect()
 }
 
-fn main() -> anyhow::Result<()> {
+/// Where NabyTune writes what went wrong: `%LOCALAPPDATA%\NabyTune\errors.log`.
+fn error_log() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("NabyTune");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("errors.log"))
+}
+
+fn log_error(what: &str) {
+    use std::io::Write as _;
+    if let Some(path) = error_log() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let _ = writeln!(f, "[{at}] NabyTune {}: {what}", env!("CARGO_PKG_VERSION"));
+        }
+    }
+}
+
+/// A message box, for the failures that stop NabyTune before it has a window: without one
+/// (it has no console) the app would just never appear.
+fn show_fatal(what: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let text: Vec<u16> =
+        format!("NabyTune couldn't start.\n\n{what}\n\nDetails are in %LOCALAPPDATA%\\NabyTune\\errors.log.\0").encode_utf16().collect();
+    let title: Vec<u16> = "NabyTune\0".encode_utf16().collect();
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_ICONERROR | MB_OK);
+    }
+}
+
+fn main() {
+    // A panic anywhere is written down; on the main thread (which ends the app) it's shown too,
+    // rather than the window just vanishing.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let what = format!("{info}");
+        log_error(&format!("panic: {what}"));
+        if std::thread::current().name() == Some("main") {
+            show_fatal(&what);
+        }
+        default_hook(info);
+    }));
+    if let Err(e) = run() {
+        let what = format!("{e:#}");
+        log_error(&what);
+        show_fatal(&what);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     // Installed: the same app id as the Start Menu shortcut, so the taskbar groups them and
     // Windows' media flyout names NabyTune. (Run from elsewhere, no shortcut names the id.)
     let installed = std::env::current_exe().ok().is_some_and(|exe| exe.to_string_lossy().to_lowercase().contains("\\programs\\nabytune\\"));
@@ -1421,7 +1515,7 @@ fn main() -> anyhow::Result<()> {
         windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
         }
     }
-    let seeds = load_seeds()?;
+    let seeds = load_seeds();
 
     gpui_platform::application().run(move |cx: &mut App| {
         search_box::bind_keys(cx);

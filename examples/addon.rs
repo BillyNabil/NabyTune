@@ -6,6 +6,9 @@
 mod addon;
 #[path = "../src/decoder.rs"]
 mod decoder;
+#[path = "../src/lyrics_sources.rs"]
+#[allow(dead_code)]
+mod lyrics_sources;
 #[path = "../src/lyrics.rs"]
 mod lyrics;
 

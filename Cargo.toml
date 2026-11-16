@@ -41,6 +41,8 @@ wana_kana = "5"
 pinyin = "0.11"
 # The listener's own music files: their tags, length and embedded covers (local_files.rs).
 lofty = "0.25"
+# Apple's TTML lyrics (lrc.red, BiniLyrics, BetterLyrics), word by word.
+roxmltree = "0.20"
 
 [profile.release]
 codegen-units = 1

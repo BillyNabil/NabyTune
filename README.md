@@ -42,7 +42,7 @@ of your own whenever you want it.
 
 | | |
 |---|---|
-| 🎤 **Synced lyrics** | Word-by-word karaoke, six lyric looks, blur-to-focus, a click on a line jumps to it, and `[` / `]` move the timing when a source is off. Lyrics come from LyricsPlus, LRCLIB, KuGou and YouTube Music, and you can switch between them. |
+| 🎤 **Synced lyrics** | Word-by-word karaoke, six lyric looks, blur-to-focus, a click on a line jumps to it, and `[` / `]` move the timing when a source is off. Lyrics come from lrc.red, BiniLyrics, BetterLyrics, LyricsPlus, Unison, KuGou, LRCLIB and YouTube Music, asked all at once with word-timed sources first, and you can switch between them. |
 | 🔤 **Romaji and more** | Lyrics in Latin letters under each line: Japanese (kanji readings included), Chinese pinyin, Korean, Cyrillic, Greek, Devanagari, Thai and Arabic script. |
 | 🖥️ **Full-screen stage** | Five layouts (*Side by side*, *Center*, *Full cover*, *Lyrics only*, *Card*), five backgrounds, and visuals that move with the beat. |
 | 🪟 **Lyrics on the desktop** | The sung line floats over games, browsers and anything else. Lock it and clicks pass straight through. Its background can be none, a soft shadow, see-through or dark. |

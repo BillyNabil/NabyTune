@@ -5,6 +5,9 @@
 #[path = "../src/account.rs"]
 #[allow(dead_code)]
 mod account;
+#[path = "../src/lyrics_sources.rs"]
+#[allow(dead_code)]
+mod lyrics_sources;
 #[path = "../src/lyrics.rs"]
 #[allow(dead_code)]
 mod lyrics;
@@ -38,6 +41,24 @@ fn main() -> anyhow::Result<()> {
         let page = yt.browse_raw(serde_json::json!({ "browseId": id }))?;
         std::fs::write(std::env::temp_dir().join("naby-page.json"), serde_json::to_string_pretty(&page)?)?;
         println!("wrote {}", std::env::temp_dir().join("naby-page.json").display());
+        return Ok(());
+    }
+    // `playlists search <query>` and `playlists resolve <videoId>`: what a search finds, and
+    // whether a song's stream can be had.
+    if args.first().map(String::as_str) == Some("search") {
+        for item in yt.search(&args[1..].join(" "))?.iter().take(8) {
+            println!("{} | {} | {} | {}", item.video_id, item.title, item.artist, item.duration);
+        }
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("resolve") {
+        match yt.resolve(&args[1]) {
+            Ok(s) => match yt.download(&s) {
+                Ok(bytes) => println!("ok: {} of {} bytes fetched, {:?}", bytes.len(), s.content_length, s.length),
+                Err(e) => println!("resolved, but fetching failed: {e:#}"),
+            },
+            Err(e) => println!("failed: {e:#}"),
+        }
         return Ok(());
     }
     // `playlists home`: Home's shelves, every page of them.

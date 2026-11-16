@@ -441,6 +441,10 @@ const TABLE: &[(&str, &str)] = &[
     ("Licence", "Lisensi"),
     ("GNU General Public License v3: you may share and change NabyTune under its terms. It comes with no warranty of any kind. The source code is available on request.", "GNU General Public License v3: kamu boleh membagikan dan mengubah NabyTune sesuai ketentuannya. NabyTune diberikan tanpa garansi apa pun. Kode sumbernya tersedia atas permintaan."),
     ("Read the licence", "Baca lisensinya"),
+    ("AAC 128 kbps · another upload", "AAC 128 kbps · unggahan lain"),
+    ("Unlock", "Buka kunci"),
+    ("Lock", "Kunci"),
+    ("Drag the words to move them · Lock lets clicks pass through", "Geser liriknya untuk memindahkan · Kunci agar klik tembus"),
     // Settings › Windows and Discord
     ("Windows and Discord", "Windows dan Discord"),
     ("Show on Discord", "Tampilkan di Discord"),

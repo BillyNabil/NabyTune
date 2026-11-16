@@ -121,7 +121,7 @@ impl NabyTune {
                 cx.notify();
             })),
         );
-        let mut rail = div().flex().flex_col().items_center().gap(px(6.0)).child(layout).child(look);
+        let mut rail = div().flex().flex_col().items_center().gap(px(6.0)).child(self.stage_volume(cx)).child(dot()).child(layout).child(look);
 
         if matches!(self.lyrics, Lyrics::Ready(_)) {
             let romaji = button(
@@ -199,8 +199,9 @@ impl NabyTune {
             .into_any_element()
     }
 
-    /// The full-screen player's volume: a speaker button (the wheel over it nudges the volume);
-    /// a click slides out the slider beside it, with the level and a mute switch.
+    /// The full-screen player's volume, at the head of the rail: a speaker like the rail's other
+    /// symbols (the wheel over it nudges the volume); a click slides the slider out to its
+    /// left, with the level and a mute switch.
     pub(crate) fn stage_volume(&self, cx: &mut Context<Self>) -> gpui::Div {
         let open = self.stage_volume_open;
         let wheel = |this: &mut Self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>| {
@@ -210,7 +211,21 @@ impl NabyTune {
                 cx.notify();
             }
         };
-        let button = action("s-volume", volume_glyph(self.muted, self.volume), open)
+        let button = div()
+            .id("s-volume")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .font_family(ICONS)
+            .text_size(px(14.0))
+            .map(|d| match open {
+                true => d.bg(rgba(0xffffff1f)).text_color(rgb(0xffffff)),
+                false => d.text_color(rgba(0xffffff8c)).hover(|s| s.bg(rgba(0xffffff14)).text_color(rgb(0xffffff))),
+            })
+            .child(volume_glyph(self.muted, self.volume))
             .on_click(cx.listener(|this, _, _, cx| {
                 // The mouse-down that closed it is this click's own: leave it closed.
                 if this.stage_volume_closed.elapsed() > Duration::from_millis(300) {
@@ -222,7 +237,7 @@ impl NabyTune {
         let level = if self.muted { 0 } else { (self.volume * 100.0).round() as u32 };
         let pop = open.then(|| {
             deferred(
-                div().absolute().left(px(40.0)).top(px(-6.0)).child(
+                div().absolute().right(px(44.0)).top(px(-5.0)).child(
                         div()
                             .id("stage-volume-pop")
                             .h(px(44.0))
@@ -251,9 +266,9 @@ impl NabyTune {
                             })))
                             .child(self.volume_slider(true, cx))
                             .child(div().w(px(28.0)).text_size(px(12.0)).text_color(rgba(SECONDARY)).child(format!("{level}")))
-                            // Slides out of the button as it fades in.
+                            // Slides out of the rail as it fades in.
                             .with_animation("stage-volume-in", gpui::Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_out_quint()), |d, k| {
-                                d.opacity(k).ml(px(-10.0 * (1.0 - k)))
+                                d.opacity(k).mr(px(-10.0 * (1.0 - k)))
                             }),
                 ),
             )
@@ -482,8 +497,13 @@ impl NabyTune {
                 let size = (area * 0.62).min(vw * 0.3).clamp(240.0, 640.0);
                 let gap = (vw * 0.05).clamp(40.0, 110.0);
                 let room = ((vw - 64.0 - 64.0 - RAIL_ROOM).min(1500.0) - size - gap).max(200.0);
+                // The lyrics get a column of their own width, sized from the window and the
+                // cover, never from the song: the group (cover, gap, column) then sits in the
+                // same place for every song, whether its lines are short or long, and the
+                // words are the same size throughout.
+                let column = room.min(size * 1.45).min(860.0);
                 let info = self.stage_info(&track, Some(cover_frame), size, false, cx);
-                let lyrics = self.lyric_column(&lyric_style((vh * 0.036).min(room * 0.055).clamp(20.0, 46.0), 0.42), window, cx);
+                let lyrics = self.lyric_column(&lyric_style((vh * 0.04).min(column * 0.058).clamp(20.0, 48.0), 0.42), window, cx);
                 div()
                     .size_full()
                     .flex()
@@ -493,14 +513,12 @@ impl NabyTune {
                     .pb(px(40.0))
                     .child(
                         div()
-                            .w_full()
-                            .max_w(px(1500.0))
                             .h_full()
                             .flex()
                             .items_center()
                             .gap(px(gap))
                             .child(info)
-                            .child(div().flex_1().min_w_0().h_full().py(px(24.0)).child(lyrics)),
+                            .child(div().w(px(column)).flex_none().h_full().py(px(24.0)).child(lyrics)),
                     )
                     .into_any_element()
             }

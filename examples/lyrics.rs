@@ -1,6 +1,9 @@
 //! Finds lyrics for a song the way the app does, then romanises a few lines.
 //! `cargo run --release --example lyrics -- "Title" "Artist" seconds`
 
+#[path = "../src/lyrics_sources.rs"]
+#[allow(dead_code)]
+mod lyrics_sources;
 #[path = "../src/lyrics.rs"]
 mod lyrics;
 #[path = "../src/romaji.rs"]

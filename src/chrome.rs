@@ -375,7 +375,7 @@ impl NabyTune {
             })))
             // Full screen: the volume too, under the buttons (the dock is out of reach), as one
             // button; its slider shows once it's clicked.
-            .when(stage, |row| div().flex().flex_col().items_center().gap(px(10.0)).child(row).child(self.stage_volume(cx)))
+
     }
 
     /// Elapsed, the line (click to seek), remaining. `cell` keeps the line's bounds for the click.
