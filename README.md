@@ -162,7 +162,8 @@ Pick one and save it as a picture to share.
 
 ```powershell
 # Rust (stable) on Windows; then, in this folder:
-cargo run --release              # run it
+cargo build --release --bins                   # build the app and sign-in helper
+cargo run --release --bin nabytune-gpui-proto  # run it
 .\package.ps1                    # build target\package\NabyTune-Setup.exe
 ```
 

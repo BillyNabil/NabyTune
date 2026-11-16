@@ -12,7 +12,7 @@ use crate::{settings, updater, NabyTune, ICONS, SECONDARY, STROKE, SUBTLE_STRONG
 
 /// Where NabyTune's releases are published ("owner/name" on GitHub). Settings' `update_repo`
 /// takes over when set; empty means updates aren't set up yet.
-pub(crate) const REPO: &str = "";
+pub(crate) const REPO: &str = "BillyNabil/NabyTune";
 
 /// How long between quiet checks.
 const EVERY: u64 = 24 * 3600;
