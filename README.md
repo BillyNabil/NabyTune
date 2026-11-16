@@ -128,9 +128,19 @@ Pick one and save it as a picture to share.
    playlists and likes. You can also skip signing in and just search and play.
 3. Press **F** for the full-screen stage, **Ctrl + D** for lyrics on the desktop, or **Ctrl + M** for the mini player.
 
+**No installer?** Download **`NabyTune-portable.zip`** from the same release instead, extract it
+anywhere (keep the files together), and open `NabyTune.exe`.
+
 > [!NOTE]
-> Windows SmartScreen may warn about an unrecognised app the first time: the installer isn't code-signed yet.
-> Choose **More info › Run anyway**.
+> NabyTune isn't code-signed yet, so Windows and your browser don't recognise it at first and may hold it back:
+>
+> - **Edge**: the download shows as blocked. Click **…** next to it, then **Keep**, then **Show more › Keep anyway**.
+> - **Chrome**: open the downloads list (**Ctrl + J**) and choose **Keep** (or **Download suspicious file**).
+> - **Windows SmartScreen** ("Windows protected your PC"): choose **More info › Run anyway**.
+> - **Microsoft Defender** removing the file: that's a false alarm on a new, unsigned app. Restore it from
+>   **Windows Security › Virus & threat protection › Protection history**, or use the portable zip.
+>
+> You can check the download is the real one: its SHA-256 is listed on the release page (`NabyTune-Setup.exe.sha256`).
 
 ### Keyboard shortcuts
 

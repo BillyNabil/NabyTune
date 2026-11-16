@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Builds NabyTune (release) and wraps it in target\package\NabyTune-Setup.exe.
 
@@ -84,9 +84,17 @@ $sumFile = "$setup.sha256"
 [System.IO.File]::WriteAllText($sumFile, $hash)
 Write-Host "SHA-256 $hash -> $sumFile" -ForegroundColor Green
 
+# 5. A portable copy, as a zip: no installer to run, and browsers rarely hold a zip back the way
+#    they do an unsigned .exe nobody has downloaded before.
+$portable = Join-Path $package 'NabyTune-portable.zip'
+if (Test-Path $portable) { Remove-Item -Force $portable }
+Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $portable
+$zipMb = '{0:N1}' -f ((Get-Item $portable).Length / 1MB)
+Write-Host "Built $portable ($zipMb MB)" -ForegroundColor Green
+
 $shown = $Version
 if (-not $shown) {
     $m = Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1
     $shown = if ($m) { $m.Matches[0].Groups[1].Value } else { '<version>' }
 }
-Write-Host "Publish: gh release create v$shown `"$setup`" `"$sumFile`" --title `"NabyTune $shown`" --notes `"...`""
+Write-Host "Publish: gh release create v$shown `"$setup`" `"$sumFile`" `"$portable`" --title `"NabyTune $shown`" --notes `"...`""
