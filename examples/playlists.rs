@@ -20,6 +20,9 @@ mod audio;
 #[path = "../src/decoder.rs"]
 #[allow(dead_code)]
 mod decoder;
+#[path = "../src/prefetch.rs"]
+#[allow(dead_code)]
+mod prefetch;
 #[path = "../src/dsp.rs"]
 #[allow(dead_code)]
 mod dsp;
@@ -91,8 +94,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let liked = yt.liked_songs()?;
-    println!("Liked music: {} songs ({:.1} s)", liked.len(), started.elapsed().as_secs_f32());
+    let (liked, complete) = yt.liked_songs()?;
+    println!("Liked music: {} songs, complete {complete} ({:.1} s)", liked.len(), started.elapsed().as_secs_f32());
     for card in yt.account_playlists()? {
         let Some(id) = card.browse_id.clone() else { continue };
         let started = std::time::Instant::now();

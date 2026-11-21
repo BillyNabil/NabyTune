@@ -191,6 +191,20 @@ pub enum Rating {
     Indifferent,
 }
 
+impl Rating {
+    /// As the library keeps a rating waiting to be sent.
+    pub fn key(self) -> &'static str {
+        match self {
+            Rating::Like => "like",
+            Rating::Dislike => "dislike",
+            Rating::Indifferent => "unlike",
+        }
+    }
+    pub fn from_key(key: &str) -> Option<Self> {
+        [Rating::Like, Rating::Dislike, Rating::Indifferent].into_iter().find(|r| r.key() == key)
+    }
+}
+
 /// An artist's page: who, and what of theirs there is.
 #[derive(Clone, Debug, Default)]
 pub struct ArtistPage {
@@ -710,19 +724,25 @@ impl YouTube {
     /// A list's first page and every page after it: YouTube Music sends a playlist about a
     /// hundred songs at a time, the rest after a continuation token each.
     fn list_pages(&self, first: Value) -> Vec<Value> {
+        self.all_list_pages(first).0
+    }
+
+    /// The pages as `list_pages` reads them, and whether every one of them came (none was
+    /// missing, and the list wasn't cut short at `MAX_LIST_PAGES`).
+    fn all_list_pages(&self, first: Value) -> (Vec<Value>, bool) {
         let mut token = next_page_token(song_list(&first));
         let mut pages = vec![first];
         let mut seen = std::collections::HashSet::new();
         while let Some(t) = token.take() {
             if pages.len() >= MAX_LIST_PAGES || !seen.insert(t.clone()) {
-                break;
+                return (pages, false);
             }
             // A page that doesn't come keeps what came before: better most of a playlist than none.
-            let Ok(page) = self.browse(json!({ "continuation": t })) else { break };
+            let Ok(page) = self.browse(json!({ "continuation": t })) else { return (pages, false) };
             token = next_page_token(&page);
             pages.push(page);
         }
-        pages
+        (pages, true)
     }
 
     /// The songs on a list's pages, the first page's from its song list only.
@@ -759,10 +779,13 @@ impl YouTube {
         Ok(())
     }
 
-    /// The account's liked songs, all of them.
-    pub fn liked_songs(&self) -> Result<Vec<SearchItem>> {
+    /// The account's liked songs, all of them, and whether every page of them came (so a
+    /// song missing from them really isn't liked).
+    pub fn liked_songs(&self) -> Result<(Vec<SearchItem>, bool)> {
         let card = Card { title: "Liked music".into(), subtitle: String::new(), thumbnail: None, browse_id: Some("VLLM".into()), video_id: None };
-        self.tracks("VLLM", &card)
+        let page = self.browse(json!({ "browseId": "VLLM" }))?;
+        let (pages, complete) = self.all_list_pages(page);
+        Ok((Self::songs_of(&pages, Some(&card)), complete))
     }
 
     /// Where a song's artist and album pages are: (artist, album) browse ids, as its row on
@@ -932,6 +955,13 @@ impl YouTube {
         tracks.retain(|t| seen.insert(t.video_id.clone()));
         anyhow::ensure!(!tracks.is_empty(), "no songs in \"{title}\"");
         Ok(tracks)
+    }
+
+    /// One song by its id (from a shared link): as YouTube Music's player lists it, first in
+    /// its own radio.
+    pub fn song(&self, video_id: &str) -> Result<SearchItem> {
+        let page = self.radio_start(Some(video_id), &format!("RDAMVM{video_id}"), None)?;
+        page.tracks.into_iter().find(|t| t.video_id == video_id).ok_or_else(|| anyhow::anyhow!("YouTube Music doesn't know that song"))
     }
 
     /// Songs like this one: YouTube Music's radio for it (what plays after it on autoplay),

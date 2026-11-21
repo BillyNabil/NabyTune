@@ -169,6 +169,14 @@ impl SearchBox {
         &self.text
     }
 
+    /// Puts `text` in, as if typed, without taking the keyboard.
+    pub fn set_text(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.marked = None;
+        self.selected = self.text.len()..self.text.len();
+        self.reversed = false;
+    }
+
     /// Empties the field.
     pub fn clear_text(&mut self, cx: &mut Context<Self>) {
         self.text.clear();

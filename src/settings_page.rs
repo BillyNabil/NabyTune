@@ -384,14 +384,58 @@ impl NabyTune {
                     .into_any_element()
             }
             (None, true, _) => row("YouTube Music", t("Finish signing in in the window that opened…"), div().text_size(px(12.0)).text_color(rgba(TERTIARY)).child(t("Waiting"))),
-            (None, false, true) => row("YouTube Music", t("Signed in; loading your account…"), div()),
+            (None, false, true) => match self.account_error.clone() {
+                // The account's name didn't come; the session may still work. Signing out and
+                // in again is the way out when it doesn't.
+                Some(e) => row(
+                    "YouTube Music",
+                    tf("Signed in, but your account didn't load: {}", &[&e]),
+                    pill("sign-out", "Sign out", false).on_click(cx.listener(|this, _, _, cx| this.sign_out(cx))),
+                ),
+                None => row("YouTube Music", t("Signed in; loading your account…"), div()),
+            },
             (None, false, false) => row(
                 "YouTube Music",
                 self.account_error.clone().unwrap_or_else(|| t("Sign in for your library, your playlists and a Home made for you").into()),
                 pill("sign-in", "Sign in", true).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))),
             ),
         };
-        section("Account", vec![row_view])
+        let mut rows = vec![row_view];
+        if self.youtube.signed_in() && !self.signing_in {
+            rows.push(row(
+                "Sync likes with YouTube Music",
+                t("Songs you like here are liked on YouTube Music too, and the other way round"),
+                switch("sync-likes", self.sync_likes).on_click(cx.listener(|this, _, _, cx| {
+                    this.sync_likes = !this.sync_likes;
+                    settings::set("sync_likes", if this.sync_likes { "1" } else { "0" });
+                    if this.sync_likes {
+                        this.load_account_likes(cx);
+                    }
+                    cx.notify();
+                })),
+            ));
+            if self.sync_likes {
+                let unsynced = self.library.unsynced_likes().len();
+                let waiting = self.library.pending_ratings.len();
+                let (hint, control): (SharedString, AnyElement) = match self.like_progress {
+                    Some((done, total)) => (
+                        tf("Sending likes to YouTube Music… {} of {}", &[&done, &total]).into(),
+                        div().text_size(px(12.0)).text_color(rgba(TERTIARY)).child(t("Syncing")).into_any_element(),
+                    ),
+                    None if unsynced + waiting > 0 => (
+                        tf("{} liked songs here aren't on YouTube Music yet", &[&(unsynced + waiting)]).into(),
+                        pill("sync-now", "Sync now", true).on_click(cx.listener(|this, _, _, cx| this.sync_likes_now(cx))).into_any_element(),
+                    ),
+                    None if self.likes_read => (
+                        t("Your likes here and on YouTube Music are the same").into(),
+                        pill("sync-again", "Check again", false).on_click(cx.listener(|this, _, _, cx| this.load_account_likes(cx))).into_any_element(),
+                    ),
+                    None => (t("Reading your likes from YouTube Music…").into(), div().into_any_element()),
+                };
+                rows.push(row("Liked songs", hint, control));
+            }
+        }
+        section("Account", rows)
     }
 
     /// Lossless: addons added by address. YouTube itself never streams lossless, so these are
@@ -1059,9 +1103,16 @@ impl NabyTune {
 
     /// Discord, the tray and the mini player.
     fn integrations_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let relay = crate::together::relay();
+        let relay_hint: SharedString = if relay == crate::listen_along::DEFAULT_RELAY {
+            t("Listen along and Blend go through ntfy.sh, a free relay (a few hundred messages a day for each internet address). An ntfy server of your own can stand in: paste its address and press Enter.").into()
+        } else {
+            tf("Listen along and Blend go through {}. Clear the field and press Enter for ntfy.sh again.", &[&relay]).into()
+        };
         section(
             "Windows and Discord",
             vec![
+                row("Listen along relay", relay_hint, self.relay_field.clone()),
                 row(
                     "Show on Discord",
                     t("Your Discord status says what you're listening to, with the cover and a link"),

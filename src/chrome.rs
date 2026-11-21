@@ -261,6 +261,7 @@ impl NabyTune {
                     .into_any_element()
             }
             Panel::UpNext => self.up_next_panel(cx),
+            Panel::Together => self.together_panel(cx),
         };
         let slide = self.panel_motion.frame(
             Motion::new(Target::default().x(0.0).opacity(1.0))
@@ -541,8 +542,10 @@ impl NabyTune {
     }
 
     pub(crate) fn dock(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let note = self.current_note();
         let status: Option<(SharedString, u32)> = match (&self.error, &self.opening, self.loading) {
             (Some(e), _, _) => Some((e.clone().into(), 0xff8a80ff)),
+            _ if note.is_some() => note.map(|n| (n, SECONDARY)),
             (None, Some(title), _) => Some((tf("Opening “{}”…", &[title]).into(), SECONDARY)),
             (None, None, true) => Some((t("Loading…").into(), SECONDARY)),
             _ => None,
@@ -592,7 +595,8 @@ impl NabyTune {
                                 .gap(px(6.0))
                                 .min_w_0()
                                 .child(div().text_size(px(14.0)).font_weight(FontWeight::SEMIBOLD).truncate().child(track.title.clone()))
-                                .child(self.heart_button("dock-heart", 13.0, cx)),
+                                .child(self.heart_button("dock-heart", 13.0, cx))
+                                .child(self.share_button("dock-share", 12.0, cx)),
                         )
                         .child(match &status {
                             Some((text, color)) => div().text_size(px(12.0)).text_color(rgba(*color)).truncate().child(text.clone()),
@@ -674,6 +678,11 @@ impl NabyTune {
                         })))
                         .child(action("queue", "\u{E8FD}", self.panel == Panel::UpNext).on_click(cx.listener(|this, _, _, cx| {
                             this.open_panel(Panel::UpNext);
+                            cx.notify();
+                        })))
+                        // Listen along and Blend; lit while a session is on.
+                        .child(action("together", crate::together::PEOPLE, self.panel == Panel::Together || self.together.is_some()).on_click(cx.listener(|this, _, _, cx| {
+                            this.open_panel(Panel::Together);
                             cx.notify();
                         })))
                         .child(action("volume", volume_glyph(self.muted, self.volume), false).on_click(cx.listener(|this, _, _, cx| {

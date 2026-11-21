@@ -1,6 +1,7 @@
 //! The audio engine: one thread owning the output device (WASAPI through
-//! cpal) and a rodio sink fed by symphonia's AAC decoder. The UI talks to it
-//! with commands and reads a shared status; it never blocks on audio.
+//! cpal) and a rodio sink fed by symphonia's AAC decoder, which runs ahead on a
+//! thread of its own (prefetch.rs). The UI talks to it with commands and reads a
+//! shared status; it never blocks on audio.
 //!
 //! Output goes to Windows' default playback device and follows it: when the listener picks
 //! other speakers or headphones (or the device in use goes away), the track carries on there,
@@ -14,6 +15,7 @@ use rodio::cpal::traits::HostTrait;
 use rodio::{Device, DeviceTrait, OutputStream, OutputStreamHandle, Sink, Source};
 
 use crate::decoder::{AudioSource, Bytes};
+use crate::prefetch::Prefetched;
 use crate::{dsp, eq};
 
 enum Command {
@@ -131,13 +133,16 @@ fn start(
             log(format!("seek on start failed: {e}"));
         }
     }
+    // Decoded on a thread of its own, seconds ahead: the device's callback only copies.
+    let (channels, rate) = (decoder.channels(), decoder.sample_rate());
+    let source = Prefetched::new(decoder, channels, rate, duration);
     let s = Sink::try_new(&output.handle).map_err(|e| e.to_string())?;
     s.set_volume(volume);
     if paused {
         s.pause();
     }
     // The equalizer, then the visualizer hears what's heard.
-    s.append(dsp::Tap::new(eq::Equalized::new(decoder, eq_params.clone()), scope.clone()));
+    s.append(dsp::Tap::new(eq::Equalized::new(source, eq_params.clone()), scope.clone()));
     Ok((s, duration))
 }
 
