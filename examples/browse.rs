@@ -19,6 +19,9 @@ mod audio;
 #[path = "../src/decoder.rs"]
 #[allow(dead_code)]
 mod decoder;
+#[path = "../src/prefetch.rs"]
+#[allow(dead_code)]
+mod prefetch;
 #[path = "../src/dsp.rs"]
 #[allow(dead_code)]
 mod dsp;

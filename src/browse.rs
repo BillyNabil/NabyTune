@@ -13,8 +13,18 @@ impl NabyTune {
         self.query = query.clone().into();
         cx.notify();
         let youtube = self.youtube.clone();
+        // A song's link pasted in (shared from NabyTune or YouTube Music): that song.
+        let linked = (query.contains("youtu") || query.trim().len() == 11).then(|| crate::share::video_id_in(&query)).flatten();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { youtube.search(&query) }).await;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match linked {
+                        Some(id) => youtube.song(&id).map(|song| vec![song]).or_else(|_| youtube.search(&query)),
+                        None => youtube.search(&query),
+                    }
+                })
+                .await;
             let _ = this.update(cx, |app, cx| {
                 app.searching = false;
                 match result {
@@ -287,7 +297,6 @@ impl NabyTune {
                         }
                         app.account = Some(info);
                         app.account_error = None;
-                        app.load_account_likes(cx);
                         app.account_playlists = playlists.unwrap_or_default();
                         for card in app.account_playlists.clone() {
                             if let Some(url) = card.thumbnail.clone() {
@@ -295,8 +304,17 @@ impl NabyTune {
                             }
                         }
                     }
-                    (Err(e), _) => app.account_error = Some(format!("{e:#}")),
+                    (Err(e), playlists) => {
+                        // Who it is didn't come (YouTube Music's menu changes now and then), but
+                        // the session may still be good: playlists and likes are tried anyway.
+                        app.account_error = Some(format!("{e:#}"));
+                        if let Ok(playlists) = playlists {
+                            app.account_playlists = playlists;
+                        }
+                    }
                 }
+                // Likes both ways, whether or not the account's name came.
+                app.load_account_likes(cx);
                 cx.notify();
             });
         })
@@ -338,6 +356,11 @@ impl NabyTune {
         self.youtube.set_account(None);
         self.account = None;
         self.account_playlists.clear();
+        // Another account signing in starts afresh: no hearts taken away for this one's.
+        self.library.forget_account();
+        self.library.save();
+        self.likes_read = false;
+        self.like_progress = None;
         self.account_error = None;
         self.load_feed(cx);
         cx.notify();

@@ -22,6 +22,8 @@ impl NabyTune {
     // ---- Playback -------------------------------------------------------------
 
     pub(crate) fn play_from(&mut self, list: Vec<Track>, index: usize, cx: &mut Context<Self>) {
+        // Music of one's own, listening along: the session goes on without following it.
+        self.stop_following(cx);
         // Another list of songs: whatever radio ran is over.
         self.radio = None;
         self.queue = list;
@@ -274,7 +276,8 @@ impl NabyTune {
                 self.library.played(saved);
                 self.library.save();
                 // The queue's last song: line up songs like it, as autoplay does.
-                if self.radio.is_none() && self.autoplay && self.index.is_some_and(|i| i + 1 >= self.queue.len()) && !self.shuffle && self.repeat == Repeat::Off {
+                // (Not while listening along: what comes next is the host's.)
+                if self.radio.is_none() && self.autoplay && !self.following() && self.index.is_some_and(|i| i + 1 >= self.queue.len()) && !self.shuffle && self.repeat == Repeat::Off {
                     self.extend_with_radio(lyric_id.clone(), cx);
                 }
                 let fade = if fade { Duration::from_secs(self.crossfade as u64) } else { Duration::ZERO };
@@ -438,6 +441,16 @@ impl NabyTune {
     }
 
     pub(crate) fn track_ended(&mut self, cx: &mut Context<Self>) {
+        // Listening along: on to the host's next song (it's queued), or wait for their news.
+        if self.following() {
+            if self.index.is_some_and(|i| i + 1 < self.queue.len()) {
+                self.index = self.index.map(|i| i + 1);
+                self.start(cx);
+            } else {
+                self.playing = false;
+            }
+            return;
+        }
         // Sleep timer set to the end of the song: stop here, whatever comes next.
         if self.sleep == Sleep::EndOfSong {
             self.sleep = Sleep::Off;

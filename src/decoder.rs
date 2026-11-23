@@ -152,6 +152,22 @@ impl Iterator for AudioSource {
     }
 }
 
+impl crate::prefetch::Decode for AudioSource {
+    /// The rest of the current packet, then the next one each call.
+    fn read_into(&mut self, out: &mut Vec<f32>) -> bool {
+        if self.pos >= self.buffer.len() && !self.refill() {
+            return false;
+        }
+        out.extend(self.buffer[self.pos..].iter().map(|s| soft_limit(*s)));
+        self.pos = self.buffer.len();
+        true
+    }
+
+    fn seek_to(&mut self, to: Duration) -> Result<(), String> {
+        rodio::Source::try_seek(self, to).map_err(|e| e.to_string())
+    }
+}
+
 impl rodio::Source for AudioSource {
     /// None: the layout never changes within a track. A frame length here makes rodio
     /// rebuild its sample-rate converter at every frame's end, which with a packet-sized

@@ -49,6 +49,10 @@ of your own whenever you want it.
 | 📻 **Mini player** | A small window that stays on top, showing the song as written, with romaji, or in romaji only. |
 | 📊 **Stats and Wrapped** | Minutes, top songs and artists, when you listen, and new discoveries. Ten Wrapped card designs, each saved as a picture in one click. |
 | ♾️ **Endless radio** | Start a radio from any song or artist and steer it toward *Popular*, *Discover*, *Deep cuts* and more. |
+| 🎧 **Listen along** | Host a session and share its code: friends hear the same song at the same moment, each on their own PC, and can send songs to your queue. |
+| 🫶 **Blend** | Mix your taste with a friend's into one playlist (songs you both love first, then turns from each of you) and see how alike you are. |
+| ❤️ **Likes, both ways** | A heart in NabyTune is a like on YouTube Music, and the other way round. Likes made while offline go once you're back. |
+| 🔗 **Share a song** | Copy any song's YouTube Music link from its menu or the dock; paste a link into search to open it. |
 | 💿 **Your own files too** | Add music folders (MP3, FLAC, M4A, OGG, WAV) and they play beside YouTube Music, in search as well. |
 | 🎚️ **Sound** | Five-band equalizer with presets, volume normalisation, crossfade, and lossless audio from addons. |
 | 🎨 **Make it yours** | Accent colour from the album cover (or any colour you like), Mica, Mica Alt, Acrylic or Solid, and the whole app in English or Bahasa Indonesia. |
@@ -165,8 +169,15 @@ anywhere (keep the files together), and open `NabyTune.exe`.
 - **Romaji worked out on your PC**: Japanese readings from a built-in dictionary
   ([lindera](https://github.com/lindera/lindera) with IPADIC), the other scripts by rule. No lyrics
   are sent anywhere to be romanised.
+- **Sound that holds up on a busy PC**: songs are decoded seconds ahead on a thread of their own,
+  the output runs at Windows' real-time audio priority (MMCSS), and NabyTune opts out of Windows'
+  power throttling, so dragging the window or a heavy app on a laptop doesn't make it stutter.
 - **Your data stays on your PC**: settings, library, listening history and stats live in
   `%APPDATA%\NabyTune`. Your YouTube Music sign-in is encrypted for your Windows user (DPAPI).
+- **Listen along and Blend** go through a relay, [ntfy](https://ntfy.sh) (ntfy.sh unless you set
+  your own server in *Settings › Windows and Discord*): only what plays, a first name and a taste
+  of a few dozen songs, under a random code. Nothing is sent unless you start or join one. ntfy.sh
+  takes about 250 messages a day per internet address; a self-hosted ntfy server has no such limit.
 
 ### Build it yourself
 

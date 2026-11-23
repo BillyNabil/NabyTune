@@ -4,6 +4,9 @@
 
 #[path = "../src/decoder.rs"]
 mod decoder;
+#[path = "../src/prefetch.rs"]
+#[allow(dead_code)]
+mod prefetch;
 
 use rodio::source::UniformSourceIterator;
 use rodio::Source;

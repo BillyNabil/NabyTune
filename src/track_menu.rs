@@ -102,8 +102,8 @@ impl NabyTune {
     /// Hearts `track` (or takes the heart back): here, and on YouTube Music when signed in.
     pub(crate) fn set_liked(&mut self, track: &Track, liked: bool, cx: &mut Context<Self>) {
         self.library.set_liked(library::Saved::from(track), liked);
+        self.rate_online(&track.video_id, if liked { Rating::Like } else { Rating::Indifferent }, cx);
         self.library.save();
-        self.rate_online(track.video_id.clone(), if liked { Rating::Like } else { Rating::Indifferent }, cx);
         cx.notify();
     }
 
@@ -118,9 +118,9 @@ impl NabyTune {
     /// recommendations from now on.
     pub(crate) fn dislike(&mut self, track: &Track, cx: &mut Context<Self>) {
         self.library.set_disliked(&track.video_id, true);
+        self.rate_online(&track.video_id, Rating::Dislike, cx);
         self.library.save();
         self.recommended.retain(|t| t.video_id != track.video_id);
-        self.rate_online(track.video_id.clone(), Rating::Dislike, cx);
         if self.current().is_some_and(|c| c.video_id == track.video_id) {
             self.skip(1, cx);
         } else if let Some(at) = self.queue.iter().position(|t| t.video_id == track.video_id) {
@@ -129,42 +129,136 @@ impl NabyTune {
         cx.notify();
     }
 
-    fn rate_online(&mut self, video_id: String, rating: Rating, cx: &mut Context<Self>) {
-        // A file on this PC is liked here only: YouTube Music doesn't know it.
-        if self.account.is_none() || crate::local::is_local(&video_id) {
-            return;
-        }
-        let youtube = self.youtube.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { youtube.rate(&video_id, rating) }).await;
-            if let Err(e) = result {
-                let _ = this.update(cx, |app, cx| {
-                    app.error = Some(tf("YouTube Music didn't take the rating: {}", &[&format!("{e:#}")]));
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+    /// Hearts and dislikes go to YouTube Music too: signed in, with Settings' "Sync likes"
+    /// on (as it is unless turned off).
+    pub(crate) fn likes_go_online(&self) -> bool {
+        self.sync_likes && self.youtube.signed_in()
     }
 
-    /// The account's liked songs, as hearts here (signed in).
-    pub(crate) fn load_account_likes(&mut self, cx: &mut Context<Self>) {
+    fn rate_online(&mut self, video_id: &str, rating: Rating, cx: &mut Context<Self>) {
+        // A file on this PC is liked here only: YouTube Music doesn't know it.
+        if !self.likes_go_online() || crate::local::is_local(video_id) {
+            return;
+        }
+        // Kept until YouTube Music takes it, so a rating made offline goes later.
+        self.library.queue_rating(video_id, rating.key());
+        self.send_ratings(cx);
+    }
+
+    /// Sends the ratings waiting, one after another, oldest first. One that doesn't go
+    /// stays waiting for the next sync (at the next start, sign-in or Sync now); a few in a
+    /// row that don't (offline, signed out elsewhere) end this round.
+    pub(crate) fn send_ratings(&mut self, cx: &mut Context<Self>) {
+        if self.ratings_sending || self.library.pending_ratings.is_empty() || !self.likes_go_online() {
+            return;
+        }
+        self.ratings_sending = true;
         let youtube = self.youtube.clone();
         cx.spawn(async move |this, cx| {
-            let found = cx.background_executor().spawn(async move { youtube.liked_songs() }).await;
-            let _ = this.update(cx, |app, cx| {
-                let Ok(found) = found else { return };
-                // Oldest first, so the newest ends up on top.
-                for item in found.into_iter().rev() {
-                    if !app.library.is_liked(&item.video_id) && !app.library.is_disliked(&item.video_id) {
-                        app.library.set_liked(library::Saved::from(&Track::from(item)), true);
+            let mut tried: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            let mut failures_in_row = 0;
+            let mut last_error: Option<String> = None;
+            let mut unsent = 0usize;
+            loop {
+                let next = this
+                    .update(cx, |app, _| {
+                        let online = app.likes_go_online();
+                        online.then(|| app.library.pending_ratings.iter().find(|p| !tried.contains(*p)).cloned()).flatten()
+                    })
+                    .ok()
+                    .flatten();
+                let Some((video_id, key)) = next else { break };
+                tried.insert((video_id.clone(), key.clone()));
+                let Some(rating) = Rating::from_key(&key) else {
+                    let _ = this.update(cx, |app, _| app.library.pending_ratings.retain(|(id, r)| !(*id == video_id && *r == key)));
+                    continue;
+                };
+                let (yt, id) = (youtube.clone(), video_id.clone());
+                let result = cx.background_executor().spawn(async move { yt.rate(&id, rating) }).await;
+                let ok = result.is_ok();
+                let alive = this.update(cx, |app, cx| {
+                    match result {
+                        Ok(()) => {
+                            app.library.rating_sent(&video_id, &key);
+                            app.library.save();
+                            if let Some((done, _)) = app.like_progress.as_mut() {
+                                *done += 1;
+                            }
+                        }
+                        Err(e) => last_error = Some(format!("{e:#}")),
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+                if ok {
+                    failures_in_row = 0;
+                } else {
+                    unsent += 1;
+                    failures_in_row += 1;
+                    if failures_in_row >= 3 {
+                        break;
                     }
                 }
-                app.library.save();
+                // Gently: one at a time, as a person clicking would.
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.ratings_sending = false;
+                app.like_progress = None;
+                if let Some(e) = last_error {
+                    let waiting = app.library.pending_ratings.len().max(unsent);
+                    app.error = Some(tf("YouTube Music didn't take {} likes yet ({}); they'll be sent again later", &[&waiting, &e]));
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Two-way: the account's liked songs, as hearts here; songs unliked on YouTube Music
+    /// since the last look, unliked here; then whatever waits to go is sent.
+    pub(crate) fn load_account_likes(&mut self, cx: &mut Context<Self>) {
+        if !self.likes_go_online() {
+            return;
+        }
+        let youtube = self.youtube.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { youtube.liked_songs() }).await;
+            let _ = this.update(cx, |app, cx| {
+                match found {
+                    Ok((items, complete)) => {
+                        let fresh = items.into_iter().map(|item| library::Saved::from(&Track::from(item))).collect();
+                        let (added, removed) = app.library.merge_account_likes(fresh, complete);
+                        crate::audio::log(format!("account likes: {added} added, {removed} unliked, complete {complete}"));
+                        app.library.save();
+                        app.likes_read = true;
+                    }
+                    Err(e) => crate::audio::log(format!("account likes didn't come: {e:#}")),
+                }
+                app.send_ratings(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Settings' Sync now: every heart here the account doesn't have yet goes to it, oldest
+    /// first (so YouTube Music's Liked music ends up in the same order).
+    pub(crate) fn sync_likes_now(&mut self, cx: &mut Context<Self>) {
+        let ids = self.library.unsynced_likes();
+        if ids.is_empty() {
+            self.load_account_likes(cx);
+            return;
+        }
+        for id in ids.iter().rev() {
+            self.library.queue_rating(id, Rating::Like.key());
+        }
+        self.library.save();
+        self.like_progress = Some((0, ids.len()));
+        self.send_ratings(cx);
+        cx.notify();
     }
 
     /// The menu, by the mouse, kept inside the window.
@@ -286,6 +380,24 @@ impl NabyTune {
                 cx.notify();
             })));
         rows += 3.0;
+        // Listening along, where the host takes songs: this one for their queue.
+        if self.can_suggest() && !crate::local::is_local(&track.video_id) {
+            let sent = track.clone();
+            card = card.child(item("tm-suggest", crate::together::PEOPLE, t("Send to the session").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.close_track_menu();
+                this.suggest_to_session(&sent, cx);
+            })));
+            rows += 1.0;
+        }
+        // A file on this PC has no link to give.
+        if !crate::local::is_local(&track.video_id) {
+            let shared = track.clone();
+            card = card.child(item("tm-share", crate::share::SHARE, t("Share song link").into()).on_click(cx.listener(move |this, _, _, cx| {
+                this.close_track_menu();
+                this.share_link(&shared, cx);
+            })));
+            rows += 1.0;
+        }
         let height = 48.0 + (rows - 3.0) * 35.0 + separators * 9.0 + 14.0;
         let viewport = window.viewport_size();
         let x = f32::from(at.x).clamp(8.0, f32::from(viewport.width) - 248.0);

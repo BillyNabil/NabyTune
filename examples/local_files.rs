@@ -7,6 +7,9 @@
 #[path = "../src/decoder.rs"]
 #[allow(dead_code)]
 mod decoder;
+#[path = "../src/prefetch.rs"]
+#[allow(dead_code)]
+mod prefetch;
 #[path = "../src/local_files.rs"]
 #[allow(dead_code)]
 mod local_files;

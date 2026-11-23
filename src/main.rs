@@ -13,12 +13,14 @@ mod addon;
 mod ambient;
 mod appearance;
 mod audio;
+mod blend;
 mod decoder;
 mod desktop_lyrics;
 mod dsp;
 mod eq;
 mod i18n;
 mod integrations;
+mod listen_along;
 mod library;
 mod library_page;
 mod local;
@@ -37,9 +39,12 @@ mod browse;
 mod chrome;
 mod lyrics_view;
 mod player;
+mod prefetch;
 mod stage;
 mod settings;
 mod settings_page;
+mod together;
+mod share;
 mod shelf;
 mod smooth_move;
 mod snapshot;
@@ -691,6 +696,8 @@ enum Panel {
     None,
     Lyrics,
     UpNext,
+    /// Listen along and Blend (together.rs).
+    Together,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -727,6 +734,8 @@ struct NabyTune {
     feed_motion: Vec<MotionState>,
     /// A playlist or album being opened from a card, by title.
     opening: Option<SharedString>,
+    /// A short note in the dock (a link copied…), and when it came.
+    note: Option<(SharedString, Instant)>,
     results: Listing,
     query: SharedString,
     searching: bool,
@@ -816,6 +825,29 @@ struct NabyTune {
     account_error: Option<String>,
     /// The account's playlists, "Liked music" first.
     account_playlists: Vec<youtube::Card>,
+    /// Hearts and dislikes go to YouTube Music, and its likes come here (Settings › Account).
+    sync_likes: bool,
+    /// Ratings are on their way to YouTube Music.
+    ratings_sending: bool,
+    /// Sync now's progress: likes sent, of how many.
+    like_progress: Option<(usize, usize)>,
+    /// The account's likes were read this session (so what's left unsynced is known).
+    likes_read: bool,
+
+    // ---- Together (together.rs)
+    /// The listen-along session, hosted here or joined.
+    together: Option<together::Session>,
+    together_error: Option<SharedString>,
+    /// Where a friend's session code is typed, and a friend's Blend code.
+    join_field: Entity<SearchBox>,
+    blend_field: Entity<SearchBox>,
+    /// Settings' relay address.
+    relay_field: Entity<SearchBox>,
+    /// A Blend started here, waiting for the friend; one being worked out; the last made.
+    blend_wait: Option<together::BlendWait>,
+    blend_busy: bool,
+    blend_error: Option<SharedString>,
+    blend_made: Option<together::BlendMade>,
 
     // ---- Pages opened from others
     artist_view: Option<pages::ArtistView>,
@@ -966,6 +998,13 @@ impl NabyTune {
         let search = cx.new(SearchBox::new);
         let name_field = cx.new(|cx| SearchBox::field("Playlist name", 300.0, cx));
         let addon_field = cx.new(|cx| SearchBox::field("Addon address (https://…)", 340.0, cx));
+        let join_field = cx.new(|cx| SearchBox::field("Friend's session code", 200.0, cx));
+        let blend_field = cx.new(|cx| SearchBox::field("Friend's Blend code", 200.0, cx));
+        let relay_field = cx.new(|cx| {
+            let mut field = SearchBox::field("https://ntfy.sh", 220.0, cx);
+            field.set_text(&settings::get("listen_relay").unwrap_or_default());
+            field
+        });
         let subscription = vec![
             cx.subscribe(&search, |this, _, Submitted(query), cx| this.run_search(query.clone(), cx)),
             // Escape in an empty box hands the keyboard back to the app (Ctrl+P and the rest).
@@ -980,6 +1019,15 @@ impl NabyTune {
                 cx.notify();
             }),
             cx.subscribe(&addon_field, |this, _, Submitted(url), cx| this.add_addon(url.clone(), cx)),
+            cx.subscribe(&join_field, |this, _, Submitted(code), cx| this.join_session(&code.clone(), cx)),
+            cx.subscribe(&blend_field, |this, _, Submitted(code), cx| this.join_blend(&code.clone(), cx)),
+            // Settings' relay: an address of an ntfy server, or nothing for ntfy.sh.
+            cx.subscribe(&relay_field, |this, _, Submitted(url), cx| {
+                let url = url.trim().trim_end_matches('/');
+                let url = if url.is_empty() || url.starts_with("http") { url.to_string() } else { format!("https://{url}") };
+                settings::set("listen_relay", &url);
+                this.note(if url.is_empty() { t("Listen along goes through ntfy.sh again").to_string() } else { tf("Listen along goes through {} from the next session", &[&url]) }, cx);
+            }),
             cx.subscribe_in(&name_field, window, |this, _, _: &Dismissed, window, cx| {
                 this.renaming = false;
                 this.root.focus(window, cx);
@@ -1003,6 +1051,7 @@ impl NabyTune {
                 }
                 app.maybe_crossfade(cx);
                 app.tick_integrations(cx);
+                app.together_tick(cx);
                 // The sleep timer ran out: pause, and the timer is done.
                 if app.sleep_at.is_some_and(|at| Instant::now() >= at) {
                     app.sleep = Sleep::Off;
@@ -1048,6 +1097,7 @@ impl NabyTune {
             feed: Feed::Loading,
             feed_motion: Vec::new(),
             opening: None,
+            note: None,
             results: Listing::new(Vec::new()),
             query: SharedString::default(),
             searching: false,
@@ -1118,6 +1168,19 @@ impl NabyTune {
             signing_in: false,
             account_error: None,
             account_playlists: Vec::new(),
+            sync_likes: settings::get("sync_likes").is_none_or(|v| v != "0"),
+            ratings_sending: false,
+            like_progress: None,
+            likes_read: false,
+            together: None,
+            together_error: None,
+            join_field,
+            blend_field,
+            relay_field,
+            blend_wait: None,
+            blend_busy: false,
+            blend_error: None,
+            blend_made: None,
             artist_view: None,
             collection_view: None,
             back_stack: Vec::new(),
@@ -1214,6 +1277,8 @@ impl NabyTune {
             app.youtube.set_account(Some(cookie));
             app.load_account(cx);
         }
+        // A Blend started last time, still waiting for the friend's answer.
+        app.resume_blend();
         app.load_feed(cx);
         app.media = media::Media::new(window);
         app.set_up_window(window, cx);
@@ -1514,6 +1579,8 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
+    // Full speed even minimised or behind a heavy app: a throttled player crackles.
+    prefetch::keep_full_speed();
     // Installed: the same app id as the Start Menu shortcut, so the taskbar groups them and
     // Windows' media flyout names NabyTune. (Run from elsewhere, no shortcut names the id.)
     let installed = std::env::current_exe().ok().is_some_and(|exe| exe.to_string_lossy().to_lowercase().contains("\\programs\\nabytune\\"));
