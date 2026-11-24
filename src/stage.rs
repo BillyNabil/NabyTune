@@ -126,23 +126,11 @@ impl NabyTune {
         if matches!(self.lyrics, Lyrics::Ready(_)) {
             let romaji = button(
                 "rail-romaji",
-                match self.show_romaji {
-                    true => "Hide romaji",
-                    false => "Romaji",
-                },
-                div().font_family(DISPLAY).text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child("あ").into_any_element(),
-                toggled(self.show_romaji),
-                self.extras.romaji_pending,
-                Box::new(cx.listener(|this, _, _, cx| {
-                    // On but with nothing to show (it failed): a click tries again rather than switching off.
-                    let failed = this.show_romaji && this.extras.romaji.is_none() && !this.extras.romaji_pending;
-                    if !failed {
-                        this.show_romaji = !this.show_romaji;
-                        settings::set("lyrics_romaji", if this.show_romaji { "1" } else { "0" });
-                    }
-                    this.fetch_extras(cx);
-                    cx.notify();
-                })),
+                "Lyric language",
+                div().font_family(DISPLAY).text_size(px(15.0)).font_weight(FontWeight::SEMIBOLD).child(self.lyric_language.short_label()).into_any_element(),
+                toggled(self.lyric_language != crate::lyrics_view::LyricLanguage::Original),
+                self.lyric_language.wants_latin() && self.extras.romaji_pending,
+                Box::new(cx.listener(|this, _, _, cx| this.cycle_lyric_language(cx))),
             );
             rail = rail.child(romaji);
         }
@@ -178,7 +166,7 @@ impl NabyTune {
             .flex_col()
             .justify_center()
             .child(
-                div().relative().child(rail).when_some(self.extras.note.clone(), |d, note| {
+                div().relative().child(rail).when_some(self.lyric_language_note(), |d, note| {
                     d.child(
                         div()
                             .absolute()

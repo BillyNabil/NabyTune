@@ -179,10 +179,15 @@ impl NabyTune {
         self.go_to(Tab::Collection);
         cx.notify();
         let youtube = self.youtube.clone();
+        let revision = self.account_revision;
+        let requested = browse_id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { youtube.collection(&browse_id, &card) }).await;
             let _ = this.update(cx, |app, cx| {
-                let Some(view) = app.collection_view.as_mut() else { return };
+                if app.account_revision != revision {
+                    return;
+                }
+                let Some(view) = app.collection_view.as_mut().filter(|view| view.card.browse_id.as_deref() == Some(requested.as_str())) else { return };
                 match result {
                     Ok((header, items)) => {
                         view.tracks = items.into_iter().map(Track::from).collect();
@@ -377,7 +382,11 @@ impl NabyTune {
             None => (view.card.title.clone().into(), view.card.subtitle.clone().into(), SharedString::default()),
         };
         // Liked songs is NabyTune's own page, so its header is in the UI's language.
-        let liked = view.card.browse_id.as_deref() == Some("local:liked");
+        let browse_id = view.card.browse_id.as_deref();
+        let liked = browse_id == Some("local:liked");
+        let liked_music = liked || browse_id == Some("VLLM");
+        let playlist = browse_id.is_some_and(|id| id.starts_with("VL"));
+        let account_playlist = self.account_playlists.iter().any(|card| card.browse_id.as_deref() == browse_id);
         let (title, kind, byline) = if liked { (t("Liked songs").into(), t("PLAYLIST").into(), t("Your hearts, newest first").into()) } else { (title, kind, byline) };
         let status: Option<SharedString> = match (&view.error, view.header.is_some()) {
             (Some(e), _) => Some(e.clone().into()),
@@ -426,7 +435,35 @@ impl NabyTune {
                         .child(div().font_family(DISPLAY).text_size(px(34.0)).line_height(px(40.0)).font_weight(FontWeight::BOLD).child(title))
                         .when(!byline.is_empty(), |d| d.child(div().text_size(px(14.0)).font_weight(FontWeight::SEMIBOLD).child(byline)))
                         .child(div().text_size(px(13.0)).text_color(rgba(SECONDARY)).child(status.unwrap_or(summary)))
-                        .when(count > 0, |d| d.child(div().pt_2().child(self.play_buttons("collection-play", Source::Collection, cx)))),
+                        .when(count > 0, |d| d.child(
+                            div().pt_2().flex().flex_wrap().gap_2()
+                                .child(self.play_buttons("collection-play", Source::Collection, cx))
+                                .when(playlist || liked, |d| d.child(
+                                    crate::library_page::button(
+                                        "collection-share",
+                                        crate::share::SHARE,
+                                        t(if liked_music { "Share liked songs" } else { "Share playlist" }),
+                                        false,
+                                    ).on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(view) = &this.collection_view {
+                                            let title = if liked { t("Liked songs").to_string() } else { view.card.title.clone() };
+                                            let tracks = view.tracks.clone();
+                                            let id = (!liked_music).then(|| view.card.browse_id.clone()).flatten();
+                                            this.share_collection(&title, id.as_deref(), &tracks, cx);
+                                        }
+                                    }))
+                                ))
+                                .when(account_playlist && !liked_music, |d| d.child(
+                                    crate::library_page::button("collection-share-tracks", crate::share::SHARE, t("Copy song links"), false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(view) = &this.collection_view {
+                                                let title = view.card.title.clone();
+                                                let tracks = view.tracks.clone();
+                                                this.share_collection(&title, None, &tracks, cx);
+                                            }
+                                        }))
+                                ))
+                        )),
                 ),
         );
         let tracks = view.tracks.clone();

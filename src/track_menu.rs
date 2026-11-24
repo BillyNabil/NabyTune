@@ -153,7 +153,8 @@ impl NabyTune {
             return;
         }
         self.ratings_sending = true;
-        let youtube = self.youtube.clone();
+        let youtube = std::sync::Arc::new(self.youtube.account_snapshot());
+        let revision = self.account_revision;
         cx.spawn(async move |this, cx| {
             let mut tried: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
             let mut failures_in_row = 0;
@@ -162,7 +163,7 @@ impl NabyTune {
             loop {
                 let next = this
                     .update(cx, |app, _| {
-                        let online = app.likes_go_online();
+                        let online = app.account_revision == revision && app.likes_go_online();
                         online.then(|| app.library.pending_ratings.iter().find(|p| !tried.contains(*p)).cloned()).flatten()
                     })
                     .ok()
@@ -177,6 +178,9 @@ impl NabyTune {
                 let result = cx.background_executor().spawn(async move { yt.rate(&id, rating) }).await;
                 let ok = result.is_ok();
                 let alive = this.update(cx, |app, cx| {
+                    if app.account_revision != revision {
+                        return;
+                    }
                     match result {
                         Ok(()) => {
                             app.library.rating_sent(&video_id, &key);
@@ -206,6 +210,10 @@ impl NabyTune {
             }
             let _ = this.update(cx, |app, cx| {
                 app.ratings_sending = false;
+                if app.account_revision != revision {
+                    app.send_ratings(cx);
+                    return;
+                }
                 app.like_progress = None;
                 if let Some(e) = last_error {
                     let waiting = app.library.pending_ratings.len().max(unsent);
@@ -224,9 +232,13 @@ impl NabyTune {
             return;
         }
         let youtube = self.youtube.clone();
+        let revision = self.account_revision;
         cx.spawn(async move |this, cx| {
             let found = cx.background_executor().spawn(async move { youtube.liked_songs() }).await;
             let _ = this.update(cx, |app, cx| {
+                if app.account_revision != revision || !app.likes_go_online() {
+                    return;
+                }
                 match found {
                     Ok((items, complete)) => {
                         let fresh = items.into_iter().map(|item| library::Saved::from(&Track::from(item))).collect();

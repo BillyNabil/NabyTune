@@ -8,13 +8,15 @@
 //! only gives glass to windows that can be active, and this one never takes the focus, so a
 //! game or whatever else is in front keeps it.)
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, hsla, point, prelude::*, px, rgb, rgba, size, AnyElement, App, BoxShadow, Bounds, Context, Entity, FontWeight, Point, SharedString, Subscription, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind, WindowOptions,
+    div, hsla, point, prelude::*, px, rgb, rgba, size, AnyElement, App, BoxShadow, Bounds, Context, Entity, FontWeight, MouseButton, Pixels, Point, SharedString, Size, Subscription, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use crate::floating_window;
 
 use crate::appearance::accent;
 use crate::i18n::t;
@@ -128,14 +130,94 @@ impl Backdrop {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Preset {
+    #[default]
+    Custom,
+    Cinema,
+    Neon,
+    Editorial,
+}
+
+struct LyricStyle {
+    main: u32,
+    secondary: u32,
+    dim: u32,
+    highlight: u32,
+    plate: u32,
+    stroke: u32,
+    radius: f32,
+    font: &'static str,
+    weight: FontWeight,
+}
+
+impl Preset {
+    pub(crate) const ALL: [Self; 4] = [Self::Custom, Self::Cinema, Self::Neon, Self::Editorial];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::Cinema => "cinema",
+            Self::Neon => "neon",
+            Self::Editorial => "editorial",
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        t(match self {
+            Self::Custom => "Custom",
+            Self::Cinema => "Cinema",
+            Self::Neon => "Neon",
+            Self::Editorial => "Editorial",
+        })
+    }
+
+    pub(crate) fn selected() -> Self {
+        settings::get("desk_lyrics_preset").and_then(|key| Self::ALL.into_iter().find(|p| p.key() == key)).unwrap_or_default()
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Custom => Self::Cinema,
+            Self::Cinema => Self::Neon,
+            Self::Neon => Self::Editorial,
+            Self::Editorial => Self::Custom,
+        }
+    }
+
+    fn setting_key(self, key: &str) -> String {
+        if self == Self::Custom { key.to_owned() } else { format!("{key}.{}", self.key()) }
+    }
+
+    fn default_backdrop(self) -> Backdrop {
+        match self {
+            Self::Custom => Backdrop::Shadow,
+            Self::Cinema | Self::Editorial => Backdrop::Dark,
+            Self::Neon => Backdrop::Glass,
+        }
+    }
+
+    fn style(self) -> LyricStyle {
+        let (main, secondary, dim, highlight, plate, stroke, radius, font, weight) = match self {
+            Self::Custom => (0xffffff, 0xffffffb8, 0xffffff70, accent(), 0x121212, 0xffffff2e, 18.0, DISPLAY, FontWeight::BOLD),
+            Self::Cinema => (0xfff9e8, 0xffedcbd9, 0xffefcda6, 0xffd47c, 0x0b0b0c, 0xf5ddaa55, 5.0, DISPLAY, FontWeight::SEMIBOLD),
+            Self::Neon => (0xe3fcff, 0xb4deffc9, 0xd9f6ff90, 0x6df0e0, 0x0c2341, 0x67ddf299, 13.0, DISPLAY, FontWeight::BOLD),
+            Self::Editorial => (0xffeedb, 0xf3cbb2df, 0xfbe0c59e, 0xffa98b, 0x271b25, 0xffad8490, 3.0, "Georgia", FontWeight::NORMAL),
+        };
+        LyricStyle { main, secondary, dim, highlight, plate, stroke, radius, font, weight }
+    }
+}
+
 /// What's behind the words, as kept (a soft shadow until another is picked).
 pub(crate) fn backdrop() -> Backdrop {
-    settings::get("desk_lyrics_backdrop").and_then(|k| Backdrop::from_key(&k)).unwrap_or(Backdrop::Shadow)
+    let preset = Preset::selected();
+    settings::get(&preset.setting_key("desk_lyrics_backdrop")).and_then(|k| Backdrop::from_key(&k)).unwrap_or_else(|| preset.default_backdrop())
 }
 
 /// A hairline round the plate, as kept (off until switched on).
 pub(crate) fn bordered() -> bool {
-    settings::get("desk_lyrics_border").is_some_and(|v| v == "1")
+    let preset = Preset::selected();
+    settings::get(&preset.setting_key("desk_lyrics_border")).map_or(matches!(preset, Preset::Neon | Preset::Editorial), |v| v == "1")
 }
 
 pub(crate) struct DesktopLyrics {
@@ -146,6 +228,13 @@ pub(crate) struct DesktopLyrics {
     scale: f32,
     /// Where the mouse is, as last looked: over the window, over its Unlock button.
     hover: Hover,
+    controls_above: bool,
+    dragging: bool,
+    /// Offsets are relative to the unshifted bounds measured by GPUI.
+    word_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    wanted_offset: Point<Pixels>,
+    drawn_offset: Point<Pixels>,
+    viewport: Size<Pixels>,
     /// As last applied to the window: (locked, its Unlock button taking clicks).
     applied: Option<(bool, bool)>,
 }
@@ -158,7 +247,7 @@ struct Hover {
     on_unlock: bool,
 }
 
-/// The Unlock button's width (it sits at the bottom right, where Lock was).
+/// The Unlock button's width.
 const UNLOCK_WIDTH: f32 = 112.0;
 
 pub(crate) type DesktopLyricsHandle = WindowHandle<DesktopLyrics>;
@@ -188,15 +277,10 @@ const CONTROLS: f32 = 36.0;
 /// The window's height for words of `text` px: the sung line (two rows when it's long), a
 /// smaller line under it, room for the shadow round them, and the buttons' row below.
 fn height_for(text: f32) -> f32 {
-    (SHADOW * 2.0 + text * 1.3 * 2.0 + text * 0.62 * 1.3 + 24.0 + CONTROLS).round()
+    (SHADOW * 2.0 + text * 1.3 * 2.0 + text * 0.62 * 1.3 + 32.0 + CONTROLS * 2.0).round()
 }
 
 impl NabyTune {
-    /// Lyric line `i` in Latin letters, when romaji is on and has been worked out.
-    pub(crate) fn line_extra(&self, i: usize) -> Option<SharedString> {
-        self.extras.romaji.as_ref().filter(|_| self.show_romaji)?.get(i).cloned().flatten().map(SharedString::from)
-    }
-
     /// Opens the floating lyrics (or closes them, when they're up).
     pub(crate) fn toggle_desktop_lyrics(&mut self, cx: &mut Context<Self>) {
         if self.desk_lyrics.is_some() {
@@ -212,65 +296,69 @@ impl NabyTune {
         }
         settings::set("desk_lyrics", "1");
         let app = cx.entity();
-        let height = height_for(text_size());
-        let origin = settings::get("desk_lyrics_at").and_then(|v| {
-            let (x, y) = v.split_once(',')?;
-            Some(Point::new(px(x.parse().ok()?), px(y.parse().ok()?)))
+        let (bounds, display_id) = floating_window::initial_bounds(cx, "desk_lyrics_at", size(px(WIDTH), px(height_for(text_size()))), |screen, dimensions| {
+            point(
+                screen.origin.x + (screen.size.width - dimensions.width) / 2.0,
+                screen.origin.y + screen.size.height - dimensions.height - px(28.0),
+            )
         });
-        // Where it was last (if that's still on a screen: a monitor may have gone), else low
-        // and centred, above the taskbar.
-        let origin = origin.filter(|at| {
-            let middle = Point::new(at.x + px(WIDTH / 2.0), at.y + px(height / 2.0));
-            cx.displays().iter().any(|d| d.bounds().contains(&middle))
-        });
-        let bounds = match origin {
-            Some(at) => Bounds::new(at, size(px(WIDTH), px(height))),
-            None => {
-                let screen = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds::new(Point::default(), size(px(1920.0), px(1080.0))));
-                let at = Point::new(
-                    screen.origin.x + (screen.size.width - px(WIDTH)) / 2.0,
-                    screen.origin.y + screen.size.height - px(height + 110.0),
-                );
-                Bounds::new(at, size(px(WIDTH), px(height)))
-            }
-        };
         // Opened once this update is over: the window reads the app as it draws.
         cx.defer(move |cx: &mut App| {
             let entity = app.clone();
             let opened = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    display_id,
                     titlebar: Some(TitlebarOptions { title: Some(t("NabyTune lyrics").into()), appears_transparent: true, ..Default::default() }),
                     kind: WindowKind::PopUp,
                     is_resizable: false,
+                    is_movable: false,
+                    is_minimizable: false,
                     focus: false,
                     window_background: WindowBackgroundAppearance::Transparent,
                     ..Default::default()
                 },
                 |window, cx| {
-                    let hwnd = match HasWindowHandle::window_handle(window).map(|h| h.as_raw()) {
-                        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-                        _ => 0,
-                    };
+                    let hwnd = floating_window::hwnd(window);
                     let scale = window.scale_factor();
                     cx.new(|cx| {
                         // Where the mouse is, a few times a second: locked, the window can't
                         // see it (clicks pass through), so it's looked up. Only a change repaints.
                         cx.spawn(async move |this, cx| loop {
                             cx.background_executor().timer(Duration::from_millis(120)).await;
-                            let alive = this.update(cx, |this: &mut DesktopLyrics, cx| {
-                                let now = this.hover_now();
-                                if now != this.hover {
-                                    this.hover = now;
-                                    cx.notify();
+                            if this.read_with(cx, |view: &DesktopLyrics, _| !view.dragging).unwrap_or(false) {
+                                if let Some(rect) = floating_window::rect(hwnd) {
+                                    if let Some(work) = floating_window::work_area(floating_window::center(rect)) {
+                                        floating_window::place(hwnd, rect, rect.left, rect.top, work);
+                                    }
                                 }
-                            });
-                            if alive.is_err() {
+                            }
+                            if this.update(cx, |this: &mut DesktopLyrics, cx| this.refresh_placement(cx)).is_err() {
                                 break;
                             }
                         })
                         .detach();
-                        DesktopLyrics { _observe: cx.observe(&entity, |_, _, cx| cx.notify()), app: entity, hwnd, scale, hover: Hover::default(), applied: None }
+                        let wanted_offset = settings::get("desk_lyrics_offset")
+                            .and_then(|saved| {
+                                let (x, y) = saved.split_once(',')?;
+                                let (x, y) = (x.parse::<f32>().ok()?, y.parse::<f32>().ok()?);
+                                (x.is_finite() && y.is_finite()).then(|| point(px(x), px(y)))
+                            })
+                            .unwrap_or_default();
+                        DesktopLyrics {
+                            _observe: cx.observe(&entity, |_, _, cx| cx.notify()),
+                            app: entity,
+                            hwnd,
+                            scale,
+                            hover: Hover::default(),
+                            controls_above: false,
+                            dragging: false,
+                            word_bounds: Rc::new(Cell::new(None)),
+                            wanted_offset,
+                            drawn_offset: Point::default(),
+                            viewport: window.viewport_size(),
+                            applied: None,
+                        }
                     })
                 },
             );
@@ -288,7 +376,7 @@ impl NabyTune {
         if let Some(handle) = self.desk_lyrics.take() {
             // Removed once this update is over (the window reads the app while it goes).
             cx.defer(move |cx: &mut App| {
-                let _ = handle.update(cx, |this, window, _| this.remember(window));
+                let _ = handle.update(cx, |this, _, _| this.remember());
                 let _ = handle.update(cx, |_, window, _| window.remove_window());
             });
         }
@@ -302,9 +390,14 @@ impl NabyTune {
         cx.notify();
     }
 
+    pub(crate) fn set_desktop_lyrics_preset(&mut self, preset: Preset, cx: &mut Context<Self>) {
+        settings::set("desk_lyrics_preset", preset.key());
+        cx.notify();
+    }
+
     /// What sits behind the floating words.
     pub(crate) fn set_desktop_lyrics_backdrop(&mut self, backdrop: Backdrop, cx: &mut Context<Self>) {
-        settings::set("desk_lyrics_backdrop", backdrop.key());
+        settings::set(&Preset::selected().setting_key("desk_lyrics_backdrop"), backdrop.key());
         cx.notify();
     }
 
@@ -322,7 +415,7 @@ impl NabyTune {
 
     /// A hairline round them, or none.
     pub(crate) fn set_desktop_lyrics_border(&mut self, on: bool, cx: &mut Context<Self>) {
-        settings::set("desk_lyrics_border", if on { "1" } else { "0" });
+        settings::set(&Preset::selected().setting_key("desk_lyrics_border"), if on { "1" } else { "0" });
         cx.notify();
     }
 
@@ -332,7 +425,7 @@ impl NabyTune {
         settings::set("desk_lyrics_size", &text.to_string());
         if let Some(handle) = self.desk_lyrics {
             cx.defer(move |cx: &mut App| {
-                let _ = handle.update(cx, |_, window, _| window.resize(size(px(WIDTH), px(height_for(text)))));
+                let _ = handle.update(cx, |_, window, _| window.resize(size(window.viewport_size().width, px(height_for(text)))));
             });
         }
         cx.notify();
@@ -373,28 +466,74 @@ fn clear_accent(hwnd: isize) {
 }
 
 impl DesktopLyrics {
-    fn remember(&self, window: &Window) {
-        let at = window.bounds().origin;
-        settings::set("desk_lyrics_at", &format!("{},{}", f32::from(at.x).round(), f32::from(at.y).round()));
+    fn remember(&self) {
+        if let Some(rect) = floating_window::rect(self.hwnd) {
+            let at = point(px(rect.left as f32 / self.scale), px(rect.top as f32 / self.scale));
+            let store_point = |key, value: Point<Pixels>| {
+                settings::set(key, &format!("{},{}", f32::from(value.x).round(), f32::from(value.y).round()));
+            };
+            store_point("desk_lyrics_at", at);
+            store_point("desk_lyrics_offset", self.wanted_offset);
+        }
     }
 
-    /// Where the mouse is: over the window, and over its Unlock button.
-    fn hover_now(&self) -> Hover {
-        use windows_sys::Win32::Foundation::{POINT, RECT};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
-        if self.hwnd == 0 {
+    fn refresh_placement(&mut self, cx: &mut Context<Self>) {
+        let above = floating_window::rect(self.hwnd).is_some_and(|rect| {
+            let center = floating_window::center(rect);
+            floating_window::work_area(center).is_some_and(|work| center.y > floating_window::center(work).y)
+        });
+        let now = self.hover_now(above);
+        if now != self.hover || above != self.controls_above || self.word_offset() != self.drawn_offset {
+            self.hover = now;
+            self.controls_above = above;
+            cx.notify();
+        }
+    }
+
+    fn word_offset(&self) -> Point<Pixels> {
+        let Some(words) = self.word_bounds.get() else { return Point::default() };
+        let toolbar = px(CONTROLS);
+        let (top, bottom) = if self.controls_above { (toolbar, self.viewport.height) } else { (px(0.0), self.viewport.height - toolbar) };
+        point(
+            keep_inside(self.wanted_offset.x, words.left(), words.right(), px(0.0), self.viewport.width),
+            keep_inside(self.wanted_offset.y, words.top(), words.bottom(), top, bottom),
+        )
+    }
+
+    /// Move the window first, then let the words continue through its empty space at an edge.
+    fn start_drag(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.dragging {
+            return;
+        }
+        let original = self.drawn_offset;
+        let hwnd = self.hwnd;
+        let view = cx.weak_entity();
+        self.dragging = floating_window::track_drag(window, cx, move |position, cx| {
+            floating_window::place(hwnd, position.rect, position.wanted.x, position.wanted.y, position.work);
+            let Some(rect) = floating_window::rect(hwnd) else { return };
+            let _ = view.update(cx, |view, cx| {
+                view.wanted_offset = point(
+                    original.x + px((position.wanted.x - rect.left) as f32 / view.scale),
+                    original.y + px((position.wanted.y - rect.top) as f32 / view.scale),
+                );
+                view.refresh_placement(cx);
+            });
+        }, |view, cx| {
+            view.dragging = false;
+            view.wanted_offset = view.word_offset();
+            view.remember();
+            cx.notify();
+        });
+    }
+
+    fn hover_now(&self, controls_above: bool) -> Hover {
+        let (Some(at), Some(r)) = (floating_window::cursor(), floating_window::rect(self.hwnd)) else {
             return Hover::default();
-        }
-        let mut at = POINT { x: 0, y: 0 };
-        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        unsafe {
-            if GetCursorPos(&mut at) == 0 || GetWindowRect(self.hwnd as _, &mut r) == 0 {
-                return Hover::default();
-            }
-        }
+        };
         let over = at.x >= r.left && at.x < r.right && at.y >= r.top && at.y < r.bottom;
         let px = |v: f32| (v * self.scale).round() as i32;
-        let on_unlock = over && at.x >= r.right - px(UNLOCK_WIDTH + 8.0) && at.y >= r.bottom - px(CONTROLS);
+        let top = if controls_above { r.top } else { r.bottom - px(CONTROLS) };
+        let on_unlock = over && at.x >= r.right - px(UNLOCK_WIDTH + 8.0) && at.y >= top && at.y < top + px(CONTROLS);
         Hover { over, on_unlock }
     }
 
@@ -452,27 +591,33 @@ impl Render for DesktopLyrics {
         let text = text_size();
         let now = app.lyric_now() + Duration::from_millis(150);
         let playing = app.current().is_some();
+        let preset = Preset::selected();
+        let style = preset.style();
         let backdrop = backdrop();
         let border = bordered();
         let align = align();
-        // The line being sung, and what comes under it: its romaji when that's on, else the
-        // next line.
-        let (line, under): (Option<crate::lyrics::Line>, Option<SharedString>) = match (&app.lyrics, app.sung_line()) {
+        // The sung line, with the selected companion text or the next line below it.
+        let language = app.lyric_language;
+        let (line, shown, under) = match (&app.lyrics, app.sung_line()) {
             (Lyrics::Ready(lines), Some(i)) => {
-                let line = lines.get(i).cloned().filter(|l| !l.text.trim().is_empty());
-                let extra = app.line_extra(i);
-                let next = lines.iter().skip(i + 1).find(|l| !l.text.trim().is_empty()).map(|l| SharedString::from(l.text.clone()));
-                (line, extra.or(next))
+                let line = lines.get(i).filter(|line| !line.text.trim().is_empty());
+                let (shown, extra) = line.map_or(("", None), |line| app.displayed_lyric(language, &line.text, i));
+                let under = extra.or_else(|| {
+                    lines.iter().enumerate().skip(i + 1).find(|(_, line)| !line.text.trim().is_empty())
+                        .map(|(index, line)| app.displayed_lyric(language, &line.text, index).0)
+                });
+                (line.cloned(), shown.to_owned(), under.map(SharedString::from))
             }
-            (Lyrics::Ready(lines), None) if app.lyrics_synced => {
-                (None, lines.iter().find(|l| !l.text.trim().is_empty()).map(|l| SharedString::from(l.text.clone())))
-            }
-            _ => (None, None),
+            _ => (None, String::new(), None),
         };
         // Nothing to sing: the song's name, quietly, so the window isn't blank.
         let fallback: Option<SharedString> =
             if line.is_none() { app.current().map(|t| format!("♪  {} — {}", t.title, t.artist).into()) } else { None };
+        let hint = app.lyric_language_note().unwrap_or_else(|| t("Drag the words to move them · Lock lets clicks pass through").into());
         self.scale = window.scale_factor();
+        self.viewport = window.viewport_size();
+        let offset = self.word_offset();
+        self.drawn_offset = offset;
         let hover = self.hover;
         self.apply(locked, hover.on_unlock);
         // Unlocked: the buttons, named. Locked: only Unlock, and only while the mouse is over
@@ -480,14 +625,14 @@ impl Render for DesktopLyrics {
         let controls: Option<AnyElement> = if locked {
             hover.over.then(|| self.unlock_button(hover.on_unlock, cx).into_any_element())
         } else {
-            Some(self.controls(backdrop, cx).into_any_element())
+            Some(self.controls(preset, backdrop, language, hint, cx).into_any_element())
         };
 
-        let lit = rgb(0xffffff);
-        let dim = rgba(0xffffff70);
+        let lit = rgb(style.main);
+        let dim = rgba(style.dim);
         // The sung line: word by word when the source timed its words.
         let main = match &line {
-            Some(l) if !l.words.is_empty() => {
+            Some(l) if shown == l.text && !l.words.is_empty() => {
                 let mut row = div().flex().flex_wrap().map(|d| match align {
                     Align::Left => d.justify_start(),
                     Align::Center => d.justify_center(),
@@ -497,7 +642,7 @@ impl Render for DesktopLyrics {
                     let done = word.end <= now;
                     let on = word.at <= now;
                     let colour = if done || on { lit } else { dim };
-                    row = row.child(div().text_color(colour).when(on && !done, |d| d.text_color(rgb(accent()))).child(if word.gap {
+                    row = row.child(div().text_color(colour).when(on && !done, |d| d.text_color(rgb(style.highlight))).child(if word.gap {
                         format!("{} ", word.text)
                     } else {
                         word.text.clone()
@@ -505,8 +650,8 @@ impl Render for DesktopLyrics {
                 }
                 row.into_any_element()
             }
-            Some(l) => div().text_color(lit).child(l.text.clone()).into_any_element(),
-            None => div().text_color(rgba(0xffffffb0)).text_size(px(text * 0.62)).children(fallback).into_any_element(),
+            Some(_) => div().text_color(lit).child(shown).into_any_element(),
+            None => div().text_color(rgba(style.secondary)).text_size(px(text * 0.62)).children(fallback).into_any_element(),
         };
         // Lines (and the whole block) to the side the listener picked.
         let side = |d: gpui::Div| match align {
@@ -527,13 +672,25 @@ impl Render for DesktopLyrics {
             .gap(px(4.0))
             .px(px(28.0))
             .py(px(10.0))
-            .rounded(px(18.0))
+            .rounded(px(style.radius))
             .map(|d| match backdrop {
-                Backdrop::Glass => d.bg(rgba(0x1010_1052)),
-                Backdrop::Dark => d.bg(rgba(0x1212_12dc)),
+                Backdrop::Glass => {
+                    let fill = match preset {
+                        Preset::Custom => 0x1010_1052,
+                        Preset::Neon => (style.plate << 8) | 0xbb,
+                        _ => (style.plate << 8) | 0x96,
+                    };
+                    d.bg(rgba(fill))
+                }
+                Backdrop::Dark => {
+                    let alpha = if preset == Preset::Custom { 0xdc } else { 0xe6 };
+                    d.bg(rgba((style.plate << 8) | alpha))
+                }
                 _ => d,
             })
-            .when(border && matches!(backdrop, Backdrop::Glass | Backdrop::Dark), |d| d.border_1().border_color(rgba(0xffffff2e)))
+            .when(border && matches!(backdrop, Backdrop::Glass | Backdrop::Dark), |d| {
+                d.map(|d| if preset == Preset::Editorial { d.border_b_2() } else { d.border_1() }).border_color(rgba(style.stroke))
+            })
             // A dark glow with no edge: a soft shadow of the words' own rounded box, which
             // fades out within the room left round the words (SHADOW), so the window's edge
             // never cuts it.
@@ -549,8 +706,8 @@ impl Render for DesktopLyrics {
         let words = words
             .child(
                 div()
-                    .font_family(DISPLAY)
-                    .font_weight(FontWeight::BOLD)
+                    .font_family(style.font)
+                    .font_weight(style.weight)
                     .text_size(px(text))
                     .line_height(px(text * 1.3))
                     .map(text_side)
@@ -563,20 +720,43 @@ impl Render for DesktopLyrics {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_size(px(text * 0.62))
                         .line_height(px(text * 0.62 * 1.3))
-                        .text_color(rgba(0xffffffb8))
+                        .text_color(rgba(style.secondary))
                         .map(text_side)
                         .truncate()
                         .child(u),
                 )
             });
-        // Unlocked, the words move the window (they're where the eye is); the buttons sit in
-        // their own row under them, out of the drag area, so they stay buttons. The words are
-        // at the window's top, so they can be taken right up to the top of the screen (Windows
-        // stops a window's drag area there, not its edge).
-        // Fainter when the listener wants them so; the buttons under them stay solid.
         let faded = opacity();
-        let words = words.when(faded < 100, |d| d.opacity(faded as f32 / 100.0));
-        let words = words.id("desk-words").when(!locked, |d| d.window_control_area(WindowControlArea::Drag));
+        let drag = |view: &mut Self, _: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<Self>| {
+            cx.stop_propagation();
+            view.start_drag(window, cx);
+        };
+        let words = words
+            .left(offset.x)
+            .top(offset.y)
+            .when(faded < 100, |d| d.opacity(faded as f32 / 100.0))
+            .id("desk-text")
+            .when(!locked, |d| d.cursor_move().on_mouse_down(MouseButton::Left, cx.listener(drag)));
+        let word_bounds = self.word_bounds.clone();
+        let drag_area = div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .pt(px(SHADOW))
+            .px(px(SHADOW))
+            .flex()
+            .flex_col()
+            .map(side)
+            .justify_start()
+            .on_children_prepainted(move |children, _, _| {
+                word_bounds.set(children.first().map(|bounds| Bounds::new(bounds.origin - offset, bounds.size)));
+            })
+            .id("desk-words")
+            .when(playing, |d| d.child(words))
+            .when(!locked, |d| d.cursor_move().on_mouse_down(MouseButton::Left, cx.listener(drag)));
+        let row = div().h(px(CONTROLS)).flex_none().w_full().flex().justify_end().items_center().pr(px(8.0)).children(controls);
+        let space = div().h(px(CONTROLS)).flex_none();
+        let (top, bottom) = if self.controls_above { (row, space) } else { (space, row) };
         div()
             .id("desk-lyrics")
             .size_full()
@@ -584,19 +764,10 @@ impl Render for DesktopLyrics {
             .flex()
             .flex_col()
             .items_center()
-            // Room on every side for the shadow; to one side, the words sit that close to
-            // the window's edge, so the window can be taken into a corner of the screen.
-            .child(div().flex_1().w_full().pt(px(SHADOW)).px(px(SHADOW)).flex().flex_col().map(side).justify_start().when(playing, |d| d.child(words)))
-            .child(
-                div()
-                    .h(px(CONTROLS))
-                    .w_full()
-                    .flex()
-                    .justify_end()
-                    .items_center()
-                    .pr(px(8.0))
-                    .children(controls),
-            )
+            .child(top)
+            .child(drag_area)
+            .child(bottom)
+
     }
 }
 
@@ -626,7 +797,7 @@ impl DesktopLyrics {
             }))
     }
 
-    fn controls(&self, backdrop: Backdrop, cx: &mut Context<Self>) -> gpui::Div {
+    fn controls(&self, preset: Preset, backdrop: Backdrop, language: crate::lyrics_view::LyricLanguage, hint: SharedString, cx: &mut Context<Self>) -> gpui::Div {
         let control = |id: &'static str, glyph: &'static str| {
             div()
                 .id(id)
@@ -648,9 +819,10 @@ impl DesktopLyrics {
             .flex()
             .items_center()
             .gap(px(4.0))
+            .pl(px(8.0))
             // What the plate is for, said once, where the eye goes after the words.
             .child(
-                div().flex_1().pl(px(8.0)).child(
+                div().flex_1().min_w_0().pl(px(8.0)).child(
                     div()
                         .h(px(28.0))
                         .px(px(12.0))
@@ -660,8 +832,30 @@ impl DesktopLyrics {
                         .bg(rgba(0x1414_14d0))
                         .text_size(px(11.0))
                         .text_color(rgba(0xffffffcc))
-                        .child(t("Drag the words to move them · Lock lets clicks pass through")),
+                        .truncate()
+                        .child(hint),
                 ),
+            )
+            .child(
+                div()
+                    .id("desk-preset")
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(rgba(0x1414_14ed))
+                    .hover(|s| s.bg(rgba(0x3a3a_3af0)))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xffffff))
+                    .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E790}"))
+                    .child(preset.name())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.app.update(cx, |app, cx| app.set_desktop_lyrics_preset(preset.next(), cx));
+                    })),
             )
             // What's behind the words: named, and the next one a click away.
             .child(
@@ -679,7 +873,7 @@ impl DesktopLyrics {
                     .hover(|s| s.bg(rgba(0x3a3a_3af0)))
                     .text_size(px(11.0))
                     .text_color(rgba(0xffffffcc))
-                    .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E790}"))
+                    .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E91B}"))
                     .child(backdrop.name())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.app.update(cx, |app, cx| app.set_desktop_lyrics_backdrop(backdrop.next(), cx));
@@ -731,6 +925,9 @@ impl DesktopLyrics {
                         this.app.update(cx, |app, cx| app.set_desktop_lyrics_opacity(next_opacity(percent), cx));
                     }))
             })
+            .child(control("desk-language", language.short_label()).font_family(TEXT).on_click(cx.listener(|this, _, _, cx| {
+                this.app.update(cx, |app, cx| app.cycle_lyric_language(cx));
+            })))
             .child(control("desk-smaller", "\u{E71F}").on_click(cx.listener(|this, _, _, cx| {
                 this.app.update(cx, |app, cx| app.resize_desktop_lyrics(-4.0, cx));
             })))
@@ -755,21 +952,38 @@ impl DesktopLyrics {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(div().font_family(ICONS).text_size(px(12.0)).child("\u{E72E}"))
                     .child(t("Lock"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.remember(window);
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remember();
                         this.app.update(cx, |app, cx| app.set_desktop_lyrics_locked(true, cx));
                     })),
             )
-            .child(control("desk-close", "\u{E8BB}").on_click(cx.listener(|this, _, window, cx| {
-                this.remember(window);
+            .child(control("desk-close", "\u{E8BB}").on_click(cx.listener(|this, _, _, cx| {
+                this.remember();
                 this.app.update(cx, |app, cx| app.close_desktop_lyrics(cx));
             })))
     }
 }
 
+fn keep_inside(wanted: Pixels, start: Pixels, end: Pixels, low: Pixels, high: Pixels) -> Pixels {
+    let minimum = low - start;
+    wanted.clamp(minimum, (high - end).max(minimum))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_can_reach_both_edges_inside_the_window() {
+        assert_eq!(keep_inside(px(-900.0), px(410.0), px(570.0), px(0.0), px(980.0)), px(-410.0));
+        assert_eq!(keep_inside(px(900.0), px(410.0), px(570.0), px(0.0), px(980.0)), px(410.0));
+    }
+
+    #[test]
+    fn text_reaches_the_bottom_when_controls_are_above() {
+        assert_eq!(keep_inside(px(900.0), px(72.0), px(124.0), px(36.0), px(260.0)), px(136.0));
+        assert_eq!(keep_inside(px(-900.0), px(72.0), px(124.0), px(0.0), px(224.0)), px(-72.0));
+    }
 
     #[test]
     fn backdrops_round_trip_and_cycle() {

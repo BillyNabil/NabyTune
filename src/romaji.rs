@@ -8,9 +8,8 @@
 //! - Korean: Hangul syllables by the Revised Romanization, carrying a final consonant over a
 //!   silent ㅇ ("saranghae", "eopseo").
 //! - Chinese: pinyin with tone marks, for songs with no kana at all.
-//! - Russian, Ukrainian and the like (Cyrillic), Greek, and Hindi (Devanagari): letter by
-//!   letter, as these scripts spell their sounds. (Thai runs words together and Arabic
-//!   leaves its vowels out: guessing at those would mislead more than help.)
+//! - Cyrillic, Greek, Devanagari, Thai and Arabic script have their own readers. Other
+//!   scripts use character-based transliteration when a mapping is available.
 
 use std::borrow::Cow;
 
@@ -19,11 +18,20 @@ use lindera::dictionary::load_dictionary;
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 use pinyin::ToPinyin;
+use unicode_normalization::UnicodeNormalization;
+use unicode_script::{Script, UnicodeScript};
 use wana_kana::ConvertJapanese;
 
 /// Lines already written in Latin letters need no romanisation.
 pub fn is_latin(text: &str) -> bool {
-    text.chars().all(|c| (c as u32) < 0x0250 || c.is_whitespace() || c.is_ascii_punctuation() || "’‘“”…—–".contains(c))
+    !text.chars().any(needs_reading)
+}
+
+fn needs_reading(c: char) -> bool {
+    match c.script() {
+        Script::Latin | Script::Common | Script::Inherited => false,
+        _ => c.is_alphabetic() || c.is_numeric() || unicode_normalization::char::is_combining_mark(c),
+    }
 }
 
 fn is_kana(c: char) -> bool {
@@ -44,39 +52,67 @@ fn is_hangul(c: char) -> bool {
 mod more;
 
 pub fn romanize(lines: &[String]) -> Result<Vec<Option<String>>> {
-    // Kanji alone can't tell Japanese from Chinese; kana anywhere in the song can.
-    let japanese = lines.iter().any(|l| l.chars().any(is_kana));
+    // Kana in another line can identify a line of otherwise ambiguous Han characters.
+    let japanese = lines.iter().any(|line| line.nfkc().any(is_kana));
     let mut segmenter = None;
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let text = line.trim();
-        if text.is_empty() || is_latin(text) {
+        let original = line.trim();
+        let mut reading: String = original.nfkc().collect();
+        if is_latin(&reading) && reading == original {
             out.push(None);
-        } else if text.chars().any(is_hangul) {
-            out.push(Some(korean(text)));
-        } else if japanese {
+            continue;
+        }
+
+        if reading.chars().any(is_hangul) {
+            reading = korean(&reading);
+        }
+        if reading.chars().any(is_kana) || (japanese && !original.nfkc().any(is_hangul) && reading.chars().any(is_han)) {
             if segmenter.is_none() {
                 let dictionary = load_dictionary("embedded://ipadic").map_err(|e| anyhow!("Japanese dictionary: {e}"))?;
                 segmenter = Some(Segmenter::new(Mode::Normal, dictionary, None));
             }
-            out.push(Some(japanese_line(segmenter.as_ref().unwrap(), text)?));
-        } else if text.chars().any(is_han) {
-            out.push(Some(chinese(text)));
-        } else if text.chars().any(|c| matches!(c, '\u{0400}'..='\u{04FF}')) {
-            out.push(Some(capitalise(&text.chars().map(cyrillic).collect::<String>())));
-        } else if text.chars().any(|c| matches!(c, '\u{0370}'..='\u{03FF}' | '\u{1F00}'..='\u{1FFF}')) {
-            out.push(Some(capitalise(&text.chars().map(greek).collect::<String>())));
-        } else if text.chars().any(|c| matches!(c, '\u{0900}'..='\u{097F}')) {
-            out.push(Some(capitalise(&devanagari(text))));
-        } else if more::is_thai(text) {
-            out.push(more::thai(text));
-        } else if more::is_arabic(text) {
-            out.push(more::arabic(text));
-        } else {
-            out.push(None);
+            reading = japanese_line(segmenter.as_ref().expect("Japanese segmenter"), &reading)?;
+        } else if reading.chars().any(is_han) {
+            reading = chinese(&reading);
         }
+        if reading.chars().any(|c| c.script() == Script::Cyrillic) {
+            reading = reading.chars().map(cyrillic).collect();
+        }
+        if reading.chars().any(|c| c.script() == Script::Greek) {
+            reading = reading.chars().map(greek).collect();
+        }
+        if reading.chars().any(|c| c.script() == Script::Devanagari) {
+            reading = devanagari(&reading);
+        }
+        if let Some(thai) = more::thai(&reading) {
+            reading = thai;
+        }
+        if let Some(arabic) = more::arabic(&reading) {
+            reading = arabic;
+        }
+        if !is_latin(&reading) {
+            reading = approximate_reading(&reading);
+        }
+        let reading = reading.trim();
+        out.push((!reading.is_empty() && reading != original).then(|| capitalise(reading)));
     }
     Ok(out)
+}
+
+/// Character-based fallback for scripts without a dedicated phonetic reader.
+fn approximate_reading(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for c in text.chars() {
+        if needs_reading(c) {
+            if let Some(latin) = deunicode::deunicode_char(c) {
+                output.push_str(latin);
+                continue;
+            }
+        }
+        output.push(c);
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Full-width punctuation as its plain counterpart, or None for a character to drop.
@@ -390,15 +426,37 @@ fn korean(text: &str) -> String {
             continue;
         }
         let (initial, vowel, last) = parts(c);
-        let previous_final = i.checked_sub(1).map(|j| chars[j]).filter(|p| is_hangul(*p)).map(|p| parts(p).2).unwrap_or(0);
-        // ㄹ after ㄹ is "l", not "r".
-        let initial = if initial == 5 && previous_final == 8 { "l" } else { INITIALS[initial] };
-        out.push_str(initial);
+        let start = i.checked_sub(1).map(|j| chars[j]).filter(|p| is_hangul(*p))
+            .map_or(INITIALS[initial], |prev| korean_boundary(parts(prev).2, initial, vowel).1);
+        out.push_str(start);
         out.push_str(VOWELS[vowel]);
-        let next = chars.get(i + 1).filter(|n| is_hangul(**n)).map(|n| parts(*n).0);
-        out.push_str(if next == Some(11) { CARRIED[last] } else { FINALS[last] });
+        let end = chars.get(i + 1).filter(|&&next| is_hangul(next)).map_or(FINALS[last], |&next| {
+            let (initial, vowel, _) = parts(next);
+            korean_boundary(last, initial, vowel).0
+        });
+        out.push_str(end);
     }
     capitalise(&out)
+}
+
+/// Sound changes between adjacent Hangul syllables within a written word.
+fn korean_boundary(tail: usize, onset: usize, vowel: usize) -> (&'static str, &'static str) {
+    let final_sound = FINALS[tail];
+    let initial_sound = INITIALS[onset];
+    match (tail, final_sound, onset, vowel) {
+        (7, _, 11, 20) => ("", "j"),
+        (25, _, 11, 20) => ("", "ch"),
+        (27, _, 0 | 3 | 7 | 12, _) => ("", match onset { 0 => "k", 3 => "t", 7 => "p", _ => "ch" }),
+        (4 | 8, _, 5, _) => ("l", "l"),
+        (8, _, 2, _) => ("l", "l"),
+        (0, _, 5, _) => ("", "r"),
+        (_, "ng" | "m", 5, _) => (final_sound, "n"),
+        (_, "k", 2 | 6 | 5, _) => ("ng", if onset == 5 { "n" } else { initial_sound }),
+        (_, "p", 2 | 6 | 5, _) => ("m", if onset == 5 { "n" } else { initial_sound }),
+        (_, "t", 2 | 6, _) => ("n", initial_sound),
+        (_, _, 11, _) => (CARRIED[tail], ""),
+        _ => (final_sound, initial_sound),
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +508,29 @@ mod tests {
         assert_eq!(korean("없어"), "Eopseo");
         assert_eq!(korean("서울"), "Seoul");
         assert_eq!(korean("말리"), "Malli");
+        assert_eq!(korean("국물"), "Gungmul");
+        assert_eq!(korean("같이"), "Gachi");
+        assert_eq!(korean("신라"), "Silla");
+        assert_eq!(korean("좋고"), "Joko");
+    }
+
+    #[test]
+    fn reads_decomposed_hangul_and_mixed_scripts() {
+        let decomposed: String = "한국어".nfd().collect();
+        let lines = [format!("Hey, {decomposed}!"), "안녕, мир".into(), "I love you ฉัน".into(), "Привет أحبك".into()];
+        let converted = romanize(&lines).unwrap();
+        assert_eq!(converted[0].as_deref(), Some("Hey, hangugeo!"));
+        assert_eq!(converted[1].as_deref(), Some("Annyeong, mir"));
+        assert_eq!(converted[2].as_deref(), Some("I love you chan"));
+        assert!(converted[3].as_deref().is_some_and(is_latin));
+    }
+
+    #[test]
+    fn expands_script_coverage_without_rewriting_existing_latin() {
+        let lines = ["שלום".into(), "გამარჯობა".into(), "বাংলা".into(), "Tiếng Việt".into()];
+        let converted = romanize(&lines).unwrap();
+        assert!(converted[..3].iter().all(|line| line.as_deref().is_some_and(is_latin)));
+        assert_eq!(converted[3], None);
     }
 
     #[test]
@@ -458,4 +539,3 @@ mod tests {
         assert_eq!(got[0].as_deref(), Some("Wǒ ài nǐ"));
     }
 }
-

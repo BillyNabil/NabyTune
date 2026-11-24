@@ -16,6 +16,7 @@ mod audio;
 mod blend;
 mod decoder;
 mod desktop_lyrics;
+mod floating_window;
 mod dsp;
 mod eq;
 mod i18n;
@@ -580,6 +581,7 @@ enum Lyrics {
 struct LyricExtras {
     romaji: Option<Vec<Option<String>>>,
     romaji_pending: bool,
+    english: Option<Vec<Option<String>>>,
     /// Why it isn't there (a failure).
     note: Option<SharedString>,
 }
@@ -803,7 +805,7 @@ struct NabyTune {
     extras: LyricExtras,
     /// Romaji already worked out, per song and lyric source.
     extras_cache: HashMap<String, Vec<Option<String>>>,
-    show_romaji: bool,
+    lyric_language: lyrics_view::LyricLanguage,
     look: Look,
     look_menu: Option<LookAnchor>,
     /// When a click outside last closed the menu: the same click mustn't reopen it from "Aa".
@@ -820,8 +822,9 @@ struct NabyTune {
 
     // ---- YouTube Music account
     account: Option<youtube::Account>,
-    /// The sign-in window is open.
-    signing_in: bool,
+    /// The sign-in window is open until the helper returns (including when cancelling).
+    sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    account_revision: u64,
     account_error: Option<String>,
     /// The account's playlists, "Liked music" first.
     account_playlists: Vec<youtube::Card>,
@@ -866,7 +869,7 @@ struct NabyTune {
     /// The mini player's window, while it's open.
     mini: Option<mini::MiniHandle>,
     /// How the mini player writes the sung line: as written, with romaji, or romaji alone.
-    mini_romaji: mini::MiniRomaji,
+    mini_lyric_language: lyrics_view::LyricLanguage,
     /// The lyrics floating on the desktop, while they're up, and whether clicks go through them.
     desk_lyrics: Option<desktop_lyrics::DesktopLyricsHandle>,
     desk_locked: bool,
@@ -995,7 +998,8 @@ impl NabyTune {
     fn new(seeds: Vec<Track>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // The UI's language first, so every word drawn from here on is in it.
         i18n::set_language(&settings::get("language").unwrap_or_else(|| "en".into()));
-        let search = cx.new(SearchBox::new);
+        let youtube = Arc::new(youtube::YouTube::new());
+        let search = cx.new(|cx| SearchBox::new(youtube.clone(), window, cx));
         let name_field = cx.new(|cx| SearchBox::field("Playlist name", 300.0, cx));
         let addon_field = cx.new(|cx| SearchBox::field("Addon address (https://…)", 340.0, cx));
         let join_field = cx.new(|cx| SearchBox::field("Friend's session code", 200.0, cx));
@@ -1113,7 +1117,7 @@ impl NabyTune {
             cover_large: None,
             ambient: None,
             previous_ambient: None,
-            youtube: Arc::new(youtube::YouTube::new()),
+            youtube,
             audio: audio::Audio::new(),
             generation: 0,
             loading: false,
@@ -1145,7 +1149,7 @@ impl NabyTune {
             lyric_options: Vec::new(),
             extras: LyricExtras::default(),
             extras_cache: HashMap::new(),
-            show_romaji: settings::get("lyrics_romaji").is_some_and(|v| v == "1"),
+            lyric_language: lyrics_view::LyricLanguage::load(),
             look: settings::get("lyric_look").and_then(|k| Look::from_key(&k)).unwrap_or(Look::Focus),
             look_menu: None,
             look_menu_closed: Instant::now(),
@@ -1165,7 +1169,8 @@ impl NabyTune {
             quality: SharedString::default(),
             lossless_from: None,
             account: None,
-            signing_in: false,
+            sign_in_cancel: None,
+            account_revision: 0,
             account_error: None,
             account_playlists: Vec::new(),
             sync_likes: settings::get("sync_likes").is_none_or(|v| v != "0"),
@@ -1190,7 +1195,7 @@ impl NabyTune {
             discord_on: settings::get("discord").is_none_or(|v| v != "0"),
             tray: None,
             mini: None,
-            mini_romaji: settings::get("mini_romaji").and_then(|k| mini::MiniRomaji::from_key(&k)).unwrap_or(mini::MiniRomaji::Original),
+            mini_lyric_language: lyrics_view::LyricLanguage::load_mini(),
             desk_lyrics: None,
             desk_locked: settings::get("desk_lyrics_locked").is_some_and(|v| v == "1"),
             hwnd: 0,

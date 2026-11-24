@@ -34,7 +34,35 @@ pub(crate) fn video_id_in(text: &str) -> Option<String> {
     valid(id).then(|| id.to_string())
 }
 
+fn playlist_link(browse_id: &str) -> Option<String> {
+    let id = browse_id.strip_prefix("VL")?;
+    (id.len() > 2 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .then(|| format!("https://music.youtube.com/playlist?list={id}"))
+}
+
 impl NabyTune {
+    pub(crate) fn share_collection(&mut self, title: &str, browse_id: Option<&str>, tracks: &[Track], cx: &mut Context<Self>) {
+        if let Some(link) = browse_id.and_then(playlist_link) {
+            cx.write_to_clipboard(ClipboardItem::new_string(link));
+            self.note(t("Playlist link copied. Private playlists need sharing access on YouTube Music."), cx);
+            return;
+        }
+        let links: Vec<_> = tracks.iter().filter_map(|track| {
+            let id = video_id_in(&track.video_id)?;
+            Some(format!("{} — {}\n{}", track.title, track.artist, song_link(&id)))
+        }).collect();
+        if links.is_empty() {
+            self.note(t("There are no shareable songs in this playlist"), cx);
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("{title}\n\n{}", links.join("\n\n"))));
+        self.note(if links.len() == tracks.len() {
+            t("Song links copied. Paste them to share.")
+        } else {
+            t("Song links copied. Files from this PC were skipped.")
+        }, cx);
+    }
+
     /// A note in the dock for a few seconds.
     pub(crate) fn note(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         let shown = Instant::now();
@@ -99,6 +127,14 @@ pub(crate) const SHARE: &str = "\u{E72D}";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_shareable_playlist_ids() {
+        assert_eq!(playlist_link("VLPLfoo_bar-12").as_deref(), Some("https://music.youtube.com/playlist?list=PLfoo_bar-12"));
+        assert_eq!(playlist_link("VLLM"), None);
+        assert_eq!(playlist_link("local:liked"), None);
+        assert_eq!(playlist_link("VLPLabc&extra=1"), None);
+    }
 
     #[test]
     fn finds_the_song_in_a_link() {

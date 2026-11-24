@@ -8,22 +8,19 @@
 #![windows_subsystem = "windows"]
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
-use wry::{PageLoadEvent, WebContext, WebViewBuilder};
+use wry::{WebContext, WebViewBuilder};
 
-const SIGN_IN: &str = "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&passive=true&continue=https%3A%2F%2Fmusic.youtube.com%2F";
+const SIGN_IN: &str = "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F";
 
 /// Where the sign-in window keeps its browser data (cookies), apart from everything else.
 fn data_dir() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("NabyTune").join("SignIn"))
-}
-
-enum Note {
-    Loaded,
 }
 
 fn main() {
@@ -34,31 +31,34 @@ fn main() {
         return;
     }
 
-    let event_loop = EventLoopBuilder::<Note>::with_user_event().build();
-    let proxy = event_loop.create_proxy();
+    let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Sign in to YouTube Music · NabyTune")
         .with_inner_size(LogicalSize::new(480.0, 720.0))
-        .build(&event_loop)
-        .expect("sign-in window");
-    let mut context = WebContext::new(data_dir());
+        .build(&event_loop);
+    let Ok(window) = window else { std::process::exit(2) };
+    let mut context = WebContext::new(data_dir().map(|dir| dir.with_file_name("SignInPrivate")));
     let webview = WebViewBuilder::new_with_web_context(&mut context)
+        .with_incognito(true)
         .with_url(SIGN_IN)
-        .with_on_page_load_handler(move |event, _| {
-            if matches!(event, PageLoadEvent::Finished) {
-                let _ = proxy.send_event(Note::Loaded);
-            }
-        })
-        .build(&window)
-        .expect("WebView2");
+        .build(&window);
+    let Ok(webview) = webview else { std::process::exit(2) };
 
+    let mut next_check = Instant::now();
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::WaitUntil(next_check);
         match event {
-            // Back on YouTube Music, signed in: its cookies carry a SAPISID.
-            Event::UserEvent(Note::Loaded) if webview.url().is_ok_and(|u| u.starts_with("https://music.youtube.com")) => {
+            // Navigation can finish before the authenticated cookies are available.
+            Event::MainEventsCleared if Instant::now() >= next_check => {
+                next_check = Instant::now() + Duration::from_millis(750);
+                *control_flow = ControlFlow::WaitUntil(next_check);
+                if !webview.url().is_ok_and(|url| url == "https://music.youtube.com" || url.starts_with("https://music.youtube.com/")) {
+                    return;
+                }
                 let Ok(cookies) = webview.cookies_for_url("https://music.youtube.com") else { return };
-                if cookies.iter().any(|c| matches!(c.name(), "SAPISID" | "__Secure-3PAPISID")) {
+                if cookies.iter().any(|c| {
+                    !c.value().is_empty() && matches!(c.name(), "SAPISID" | "__Secure-3PAPISID" | "__Secure-1PAPISID")
+                }) {
                     let header = cookies.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; ");
                     println!("{header}");
                     *control_flow = ControlFlow::Exit;

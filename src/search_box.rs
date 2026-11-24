@@ -5,10 +5,11 @@
 //! empty box), and × clears with the mouse. Long text scrolls to keep the caret in view.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
+    actions, deferred, div, fill, point, prelude::*, px, relative, rgb, rgba, size, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, ShapedLine, SharedString, Task, TextRun, UTF16Selection, Window,
 };
@@ -39,6 +40,8 @@ actions!(
         Cut,
         Paste,
         Submit,
+        SuggestionUp,
+        SuggestionDown,
         Clear
     ]
 );
@@ -72,6 +75,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
         KeyBinding::new("ctrl-insert", Copy, Some(CONTEXT)),
         KeyBinding::new("enter", Submit, Some(CONTEXT)),
+        KeyBinding::new("up", SuggestionUp, Some("SearchSuggestions")),
+        KeyBinding::new("down", SuggestionDown, Some("SearchSuggestions")),
         KeyBinding::new("escape", Clear, Some(CONTEXT)),
     ]);
 }
@@ -81,6 +86,13 @@ pub struct Submitted(pub String);
 
 /// Escape on an empty box: the listener moves focus back to the app.
 pub struct Dismissed;
+
+struct Suggestions {
+    youtube: Arc<crate::youtube::YouTube>,
+    items: Vec<String>,
+    selected: Option<usize>,
+    request: Option<Task<()>>,
+}
 
 pub struct SearchBox {
     text: String,
@@ -102,6 +114,7 @@ pub struct SearchBox {
     placeholder: &'static str,
     width: f32,
     shortcut: bool,
+    suggestions: Option<Suggestions>,
 }
 
 impl EventEmitter<Submitted> for SearchBox {}
@@ -140,7 +153,21 @@ fn word_end(text: &str, from: usize) -> usize {
 }
 
 impl SearchBox {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(youtube: Arc<crate::youtube::YouTube>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let field = Self {
+            shortcut: true,
+            suggestions: Some(Suggestions { youtube, items: Vec::new(), selected: None, request: None }),
+            ..Self::field("Search songs, artists, albums", 420.0, cx)
+        };
+        cx.on_blur(&field.focus, window, |this, _, cx| {
+            this.dismiss_suggestions();
+            cx.notify();
+        }).detach();
+        field
+    }
+
+    /// A plain text field without autocomplete.
+    pub fn field(placeholder: &'static str, width: f32, cx: &mut Context<Self>) -> Self {
         Self {
             text: String::new(),
             selected: 0..0,
@@ -153,15 +180,11 @@ impl SearchBox {
             last_bounds: None,
             scroll: px(0.0),
             dragging: false,
-            placeholder: "Search songs, artists, albums",
-            width: 420.0,
-            shortcut: true,
+            placeholder,
+            width,
+            shortcut: false,
+            suggestions: None,
         }
-    }
-
-    /// A plain text field: `placeholder` while empty, `width` wide, no shortcut hint.
-    pub fn field(placeholder: &'static str, width: f32, cx: &mut Context<Self>) -> Self {
-        Self { placeholder, width, shortcut: false, ..Self::new(cx) }
     }
 
     /// What's typed.
@@ -171,6 +194,7 @@ impl SearchBox {
 
     /// Puts `text` in, as if typed, without taking the keyboard.
     pub fn set_text(&mut self, text: &str) {
+        self.dismiss_suggestions();
         self.text = text.to_string();
         self.marked = None;
         self.selected = self.text.len()..self.text.len();
@@ -179,6 +203,7 @@ impl SearchBox {
 
     /// Empties the field.
     pub fn clear_text(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_suggestions();
         self.text.clear();
         self.marked = None;
         self.move_to(0, cx);
@@ -253,6 +278,62 @@ impl SearchBox {
         let new = new.replace(['\n', '\r'], " ");
         self.text.replace_range(range.clone(), &new);
         self.move_to(range.start + new.len(), cx);
+        self.refresh_suggestions(cx);
+    }
+
+    fn dismiss_suggestions(&mut self) {
+        if let Some(state) = &mut self.suggestions {
+            state.request = None;
+            state.items.clear();
+            state.selected = None;
+        }
+    }
+
+    fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_suggestions();
+        let Some(state) = &mut self.suggestions else { return };
+        let query = self.text.trim().to_owned();
+        if self.marked.is_some() || query.chars().count() < 2 || query.contains("://") || query.contains("youtu.be/") || query.len() > 256 {
+            return;
+        }
+        let youtube = state.youtube.clone();
+        let language = crate::i18n::language();
+        state.request = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(230)).await;
+            let requested = query.clone();
+            let items = cx.background_executor().spawn(async move {
+                youtube.search_suggestions(&query, language).unwrap_or_default()
+            }).await;
+            let _ = this.update(cx, |field, cx| {
+                if field.marked.is_none() && field.text.trim() == requested {
+                    if let Some(state) = &mut field.suggestions {
+                        state.items = items;
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn move_suggestion(&mut self, down: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.suggestions.as_mut().filter(|state| !state.items.is_empty()) else { return };
+        let last = state.items.len() - 1;
+        state.selected = match (state.selected, down) {
+            (None, true) => Some(0),
+            (None, false) => Some(last),
+            (Some(i), true) if i == last => None,
+            (Some(i), false) if i == 0 => None,
+            (Some(i), true) => Some(i + 1),
+            (Some(i), false) => Some(i - 1),
+        };
+        cx.notify();
+    }
+
+    fn choose_suggestion(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(query) = self.suggestions.as_ref().and_then(|state| state.items.get(index).cloned()) else { return };
+        self.set_text(&query);
+        self.blink(cx);
+        cx.emit(Submitted(query));
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
@@ -340,18 +421,27 @@ impl SearchBox {
         }
     }
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        let query = self.text.trim().to_string();
-        if !query.is_empty() {
-            cx.emit(Submitted(query));
+        if let Some(index) = self.suggestions.as_ref().and_then(|state| state.selected) {
+            self.choose_suggestion(index, cx);
+        } else {
+            let query = self.text.trim().to_string();
+            if !query.is_empty() {
+                self.dismiss_suggestions();
+                cx.notify();
+                cx.emit(Submitted(query));
+            }
         }
     }
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggestions.as_ref().is_some_and(|state| !state.items.is_empty()) {
+            self.dismiss_suggestions();
+            cx.notify();
+            return;
+        }
         if self.text.is_empty() {
             cx.emit(Dismissed);
         }
-        self.text.clear();
-        self.marked = None;
-        self.move_to(0, cx);
+        self.clear_text(cx);
     }
 
     /// The byte offset under a point in the window.
@@ -423,8 +513,11 @@ impl EntityInputHandler for SearchBox {
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.marked.as_ref().map(|r| to_utf16(&self.text, r.start)..to_utf16(&self.text, r.end))
     }
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked = None;
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.take().is_some() {
+            self.refresh_suggestions(cx);
+            cx.notify();
+        }
     }
     fn replace_text_in_range(&mut self, range: Option<Range<usize>>, new: &str, _: &mut Window, cx: &mut Context<Self>) {
         let r = range
@@ -442,6 +535,7 @@ impl EntityInputHandler for SearchBox {
         let new = new.replace(['\n', '\r'], " ");
         self.text.replace_range(r.clone(), &new);
         self.marked = (!new.is_empty()).then(|| r.start..r.start + new.len());
+        self.dismiss_suggestions();
         self.move_to(r.start + new.len(), cx);
     }
     fn bounds_for_range(&mut self, range: Range<usize>, bounds: Bounds<Pixels>, window: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
@@ -460,9 +554,10 @@ impl Render for SearchBox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
         let has_text = !self.text.is_empty();
-        div()
+        let suggestions = self.suggestions.as_ref().filter(|state| focused && window.is_window_active() && !state.items.is_empty());
+        let field = div()
             .id("search")
-            .key_context(CONTEXT)
+            .key_context(if suggestions.is_some() { "SearchBox SearchSuggestions" } else { CONTEXT })
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -486,6 +581,8 @@ impl Render for SearchBox {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(|this, _: &SuggestionUp, _, cx| this.move_suggestion(false, cx)))
+            .on_action(cx.listener(|this, _: &SuggestionDown, _, cx| this.move_suggestion(true, cx)))
             .on_action(cx.listener(Self::clear))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
@@ -524,10 +621,8 @@ impl Render for SearchBox {
                             .child("\u{E711}")
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.text.clear();
-                                this.marked = None;
                                 this.focus.focus(window, cx);
-                                this.move_to(0, cx);
+                                this.clear_text(cx);
                             })),
                     )
                 } else if self.shortcut {
@@ -544,7 +639,41 @@ impl Render for SearchBox {
                 } else {
                     d
                 }
-            })
+            });
+        div().relative().child(field).when_some(suggestions, |d, state| {
+            let mut panel = div()
+                .id("search-suggestions")
+                .w_full()
+                .p(px(5.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgba(crate::STROKE))
+                .bg(rgb(0x242424))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.dismiss_suggestions();
+                    cx.notify();
+                }));
+            for (index, query) in state.items.iter().enumerate() {
+                panel = panel.child(div()
+                    .id(("search-suggestion", index))
+                    .h(px(32.0))
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_size(px(13.0))
+                    .when(state.selected == Some(index), |row| row.bg(rgba((accent() << 8) | 0x42)))
+                    .hover(|row| row.bg(rgba(crate::SUBTLE_STRONG)))
+                    .child(div().flex_none().font_family(crate::ICONS).text_color(rgba(crate::SECONDARY)).child("\u{E721}"))
+                    .child(div().min_w_0().truncate().child(query.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_suggestion(index, cx))));
+            }
+            d.child(deferred(div().absolute().top(px(37.0)).left_0().right_0().child(panel)).with_priority(1))
+        })
     }
 }
 

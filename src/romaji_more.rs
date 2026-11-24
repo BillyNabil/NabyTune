@@ -16,16 +16,19 @@
 //!   the sound of a sun letter after it ("ash-shams").
 
 /// Whether the line is mostly in Thai script.
-pub fn is_thai(line: &str) -> bool {
+#[cfg(test)]
+fn is_thai(line: &str) -> bool {
     mostly(line, is_thai_char)
 }
 
 /// Whether the line is mostly in Arabic script (Arabic, Persian, Urdu and the like).
-pub fn is_arabic(line: &str) -> bool {
+#[cfg(test)]
+fn is_arabic(line: &str) -> bool {
     mostly(line, is_arabic_char)
 }
 
 /// More of the line's letters in the script than out of it.
+#[cfg(test)]
 fn mostly(line: &str, script: fn(char) -> bool) -> bool {
     let (mut inside, mut outside) = (0, 0);
     for c in line.chars().filter(|c| c.is_alphabetic()) {

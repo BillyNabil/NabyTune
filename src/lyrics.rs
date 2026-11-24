@@ -24,11 +24,12 @@ pub struct Line {
     pub text: String,
     /// Each word's own timing, where the source has it (LyricsPlus); empty for whole lines.
     pub words: Vec<Word>,
+    pub english: Option<String>,
 }
 
 impl Line {
     pub fn new(at: Duration, text: String) -> Self {
-        Self { at, text, words: Vec::new() }
+        Self { at, text, words: Vec::new(), english: None }
     }
 }
 
@@ -237,7 +238,7 @@ fn lyricsplus_lines(body: &Value) -> Option<Timed> {
             let text = if syllables.trim().is_empty() { l["text"].as_str().unwrap_or("").to_string() } else { syllables };
             let start = l["syllabus"][0]["time"].as_f64().map_or(time, |s| s.min(time));
             let words = l["syllabus"].as_array().map(|s| words_of(s)).unwrap_or_default();
-            Some(Line { at: Duration::from_secs_f64(start.max(0.0) / 1000.0), text: text.split_whitespace().collect::<Vec<_>>().join(" "), words })
+            Some(Line { at: Duration::from_secs_f64(start.max(0.0) / 1000.0), text: text.split_whitespace().collect::<Vec<_>>().join(" "), words, english: None })
         })
         .collect();
     lines.sort_by_key(|l| l.at);
@@ -548,8 +549,8 @@ pub fn cached(video_id: &str) -> Option<Vec<Found>> {
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
-    // Kept before BitChord's sources were asked: found again.
-    if v["format"].as_u64().unwrap_or(1) < 3 {
+    // Refetch earlier caches, which did not retain English translations.
+    if v["format"].as_u64().unwrap_or(1) < 4 {
         return None;
     }
     let at = |v: &serde_json::Value, k: &str| Duration::from_millis(v[k].as_u64().unwrap_or(0));
@@ -564,6 +565,7 @@ pub fn cached(video_id: &str) -> Option<Vec<Found>> {
                 .map(|l| Line {
                     at: at(l, "at"),
                     text: l["text"].as_str().unwrap_or("").to_string(),
+                    english: l["english"].as_str().map(str::to_owned),
                     words: l["words"]
                         .as_array()
                         .map(|w| w.iter().map(|w| Word { text: w["text"].as_str().unwrap_or("").to_string(), at: at(w, "at"), end: at(w, "end"), gap: w["gap"].as_bool().unwrap_or(false) }).collect())
@@ -589,6 +591,7 @@ pub fn keep(video_id: &str, found: &[Found]) {
                 "lines": f.lines.iter().map(|l| serde_json::json!({
                     "at": ms(l.at),
                     "text": l.text,
+                    "english": l.english,
                     "words": l.words.iter().map(|w| serde_json::json!({ "text": w.text, "at": ms(w.at), "end": ms(w.end), "gap": w.gap })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
             })
@@ -597,5 +600,5 @@ pub fn keep(video_id: &str, found: &[Found]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, serde_json::json!({ "format": 3, "versions": versions }).to_string());
+    let _ = std::fs::write(path, serde_json::json!({ "format": 4, "versions": versions }).to_string());
 }

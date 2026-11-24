@@ -3,7 +3,10 @@
 //! %APPDATA%\NabyTune\account.bin. Requests are signed as music.youtube.com signs its own:
 //! the cookies, and `Authorization: SAPISIDHASH <time>_<sha1(time SAPISID origin)>`.
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context as _, Result};
@@ -24,19 +27,79 @@ fn helper() -> Result<PathBuf> {
     Ok(helper)
 }
 
-/// Opens the sign-in window and waits for it: the session's cookies, or None if the
-/// window was closed first.
-pub fn sign_in() -> Result<Option<String>> {
-    let output = Command::new(helper()?).stdout(Stdio::piped()).stderr(Stdio::null()).output().context("starting the sign-in window")?;
-    let cookie = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!cookie.is_empty()).then_some(cookie))
+#[derive(Debug)]
+pub enum SignInIssue {
+    Timeout,
+    WebView,
+    MissingSession,
 }
 
-/// Forgets the session: the kept cookies, and the sign-in window's own browser data.
-pub fn sign_out() {
-    if let Some(path) = path() {
-        let _ = std::fs::remove_file(path);
+impl SignInIssue {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::Timeout => "Sign-in timed out. Please try again.",
+            Self::WebView => "Couldn't open the sign-in window. Check that Microsoft Edge WebView2 is installed, then try again.",
+            Self::MissingSession => "YouTube Music did not return a session. Please try again.",
+        }
     }
+}
+
+impl std::fmt::Display for SignInIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for SignInIssue {}
+
+/// Opens the sign-in window and waits for it: the session's cookies, or None if the
+/// window was closed first.
+pub fn sign_in(cancel: &AtomicBool) -> Result<Option<String>> {
+    let mut child = Command::new(helper()?).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("starting the sign-in window")?;
+    let mut stdout = child.stdout.take().context("opening the sign-in response")?;
+    let reader = std::thread::spawn(move || {
+        let mut response = String::new();
+        stdout.read_to_string(&mut response)?;
+        Ok::<_, std::io::Error>(response)
+    });
+    let started = Instant::now();
+    let status = loop {
+        let cancelled = cancel.load(Ordering::Relaxed);
+        if cancelled || started.elapsed() >= Duration::from_secs(300) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return if cancelled {
+                Ok(None)
+            } else {
+                Err(SignInIssue::Timeout.into())
+            };
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    anyhow::ensure!(status.success(), SignInIssue::WebView);
+    let response = reader.join().map_err(|_| anyhow::anyhow!("reading the sign-in response"))??;
+    let cookie = response.trim();
+    if cookie.is_empty() || cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    anyhow::ensure!(authorization(cookie, 0).is_some(), SignInIssue::MissingSession);
+    Ok(Some(cookie.to_owned()))
+}
+
+/// Removes the saved session before the app returns to guest mode.
+pub fn sign_out() -> Result<()> {
+    let path = path().context("no %APPDATA%")?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).context("removing the saved YouTube Music session"),
+    }
+}
+
+pub fn clear_legacy_browser_data() {
     if let Ok(helper) = helper() {
         let _ = Command::new(helper).arg("--sign-out").status();
     }
@@ -85,7 +148,7 @@ fn cookie_value<'a>(cookie: &'a str, name: &str) -> Option<&'a str> {
 /// The `Authorization` header for a request at unix time `now`, signed with the session's
 /// SAPISID (or its secure twins).
 pub fn authorization(cookie: &str, now: u64) -> Option<String> {
-    let secret = ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"].iter().find_map(|name| cookie_value(cookie, name))?;
+    let secret = ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"].iter().find_map(|name| cookie_value(cookie, name).filter(|value| !value.is_empty()))?;
     let digest = sha1_smol::Sha1::from(format!("{now} {secret} {ORIGIN}")).digest().to_string();
     Some(format!("SAPISIDHASH {now}_{digest}"))
 }

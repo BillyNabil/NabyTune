@@ -97,9 +97,24 @@ fn role<'a>(node: roxmltree::Node<'a, 'a>) -> Option<&'a str> {
     node.attributes().find(|a| a.name() == "role").map(|a| a.value())
 }
 
+fn english_language(node: roxmltree::Node<'_, '_>) -> bool {
+    node.attribute(("http://www.w3.org/XML/1998/namespace", "lang"))
+        .and_then(|lang| lang.split('-').next())
+        .is_some_and(|lang| lang.eq_ignore_ascii_case("en"))
+}
+
+fn translated_text(node: roxmltree::Node<'_, '_>) -> Option<String> {
+    let text: String = node.descendants()
+        .filter(|d| d.is_text() && !d.ancestors().any(|a| role(a) == Some("x-bg")))
+        .filter_map(|d| d.text())
+        .collect();
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
 /// Apple's TTML: each `<p>` a line, each timed `<span>` in it a syllable; spaces between
-/// spans part words. Translations and romanisations ride along as roles and are left out,
-/// and so are background vocals. A `<p>` with no timed spans is a line-synced line.
+/// spans part words. English translations stay alongside the original line. A `<p>` with
+/// no timed spans is a line-synced line.
 pub fn parse_ttml(text: &str) -> Vec<Line> {
     let Ok(doc) = roxmltree::Document::parse_with_options(text, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() }) else {
         return Vec::new();
@@ -123,7 +138,7 @@ pub fn parse_ttml(text: &str) -> Vec<Line> {
             }
             let timed = child.attribute("begin").is_some() && !child.children().any(|c| c.is_element() && c.attribute("begin").is_some());
             if timed {
-                let text: String = child.descendants().filter(|d| d.is_text()).filter_map(|d| d.text()).collect();
+                let text: String = child.descendants().filter(|d| d.is_text() && !d.ancestors().any(|a| matches!(role(a), Some("x-translation" | "x-roman" | "x-bg")))).filter_map(|d| d.text()).collect();
                 let (Some(at), end) = (child.attribute("begin").and_then(clock), child.attribute("end").and_then(clock)) else { continue };
                 let gap = text.ends_with(char::is_whitespace);
                 out.push(Syllable { text: text.trim_end().to_string(), at, end: end.unwrap_or(at + Duration::from_millis(300)), gap });
@@ -132,8 +147,19 @@ pub fn parse_ttml(text: &str) -> Vec<Line> {
             }
         }
     }
+    let in_head = |node: roxmltree::Node<'_, '_>| node.ancestors().any(|n| n.has_tag_name("head"));
+    let translations: std::collections::HashMap<_, _> = doc.descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "translation" && english_language(*node) && in_head(*node))
+        .flat_map(|node| node.children())
+        .filter_map(|node| Some((node.attribute("for")?, translated_text(node)?)))
+        .collect();
     let mut lines = Vec::new();
-    for p in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "p") {
+    for p in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "p" && !in_head(*n)) {
+        let english = p.descendants().find_map(|node| {
+            (role(node) == Some("x-translation") && english_language(node)
+                && !node.ancestors().any(|parent| role(parent) == Some("x-bg")))
+                .then(|| translated_text(node)).flatten()
+        }).or_else(|| p.attributes().find(|a| a.name() == "key").and_then(|a| translations.get(a.value()).cloned()));
         let begin = p.attribute("begin").and_then(clock);
         let mut syllables = Vec::new();
         collect(p, &mut syllables);
@@ -141,13 +167,13 @@ pub fn parse_ttml(text: &str) -> Vec<Line> {
             let text: String = p.descendants().filter(|d| d.is_text() && !d.ancestors().any(|a| matches!(role(a), Some("x-translation" | "x-roman" | "x-bg")))).filter_map(|d| d.text()).collect();
             let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
             if let Some(at) = begin {
-                lines.push(Line { at, text, words: Vec::new() });
+                lines.push(Line { at, text, words: Vec::new(), english });
             }
             continue;
         }
         let words = words_from(&syllables);
         let at = begin.map_or(syllables[0].at, |b| b.min(syllables[0].at));
-        lines.push(Line { at, text: text_of(&words), words });
+        lines.push(Line { at, text: text_of(&words), words, english });
     }
     lines.sort_by_key(|l| l.at);
     lines
@@ -195,7 +221,7 @@ pub fn parse_qrc(text: &str) -> Vec<Line> {
         if text.is_empty() {
             continue;
         }
-        lines.push(Line { at: Duration::from_millis(start), text, words });
+        lines.push(Line { at: Duration::from_millis(start), text, words, english: None });
     }
     lines
 }
@@ -239,7 +265,7 @@ pub fn parse_enhanced_lrc(text: &str) -> Vec<Line> {
                 })
                 .collect();
             let words = words_from(&syllables);
-            Line { at, text: text_of(&words), words }
+            Line { at, text: text_of(&words), words, english: None }
         })
         .collect()
 }
@@ -415,6 +441,29 @@ pub fn unison(http: &reqwest::blocking::Client, title: &str, artist: &str, secs:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_english_translation_outside_the_sung_text() {
+        let lines = parse_ttml(r#"<tt xmlns="http://www.w3.org/ns/ttml"
+            xmlns:ttm="http://www.w3.org/ns/ttml#metadata"
+            xmlns:itunes="http://music.apple.com/lyric-ttml-internal">
+            <head><metadata><translations>
+              <translation xml:lang="en-US"><text for="L2">Let’s go</text></translation>
+              <translation xml:lang="id"><text for="L2">Ayo</text></translation>
+            </translations></metadata></head>
+            <body><div>
+              <p begin="01.0"><span begin="01.0" end="02.0">夜<span ttm:role="x-translation" xml:lang="en">Night</span></span></p>
+              <p begin="02.0" itunes:key="L2">行こう</p>
+              <p begin="03.0">空<span ttm:role="x-translation" xml:lang="id">Langit</span></p>
+            </div></body></tt>"#);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].words[0].text, "夜");
+        assert_eq!(lines[0].english.as_deref(), Some("Night"));
+        assert_eq!(lines[1].text, "行こう");
+        assert_eq!(lines[1].english.as_deref(), Some("Let’s go"));
+        assert_eq!(lines[2].text, "空");
+        assert!(lines[2].english.is_none());
+    }
 
     #[test]
     fn reads_ttml_words_and_lines() {

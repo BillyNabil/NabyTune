@@ -356,9 +356,9 @@ impl NabyTune {
                 })
                 .child(t(label))
         };
-        let row_view = match (&self.account, self.signing_in, self.youtube.signed_in()) {
+        let row_view = match (&self.account, self.sign_in_cancel.is_some(), self.youtube.signed_in()) {
             (Some(account), _, _) => {
-                let photo = self.art.get("account").map(|a| a.small.clone());
+                let photo = self.art.get(&format!("account:{}", self.account_revision)).map(|a| a.small.clone());
                 let hint = if account.handle.is_empty() { t("Signed in to YouTube Music").to_string() } else { tf("{} · signed in to YouTube Music", &[&account.handle]) };
                 div()
                     .min_h(px(72.0))
@@ -383,7 +383,11 @@ impl NabyTune {
                     .child(pill("sign-out", "Sign out", false).on_click(cx.listener(|this, _, _, cx| this.sign_out(cx))))
                     .into_any_element()
             }
-            (None, true, _) => row("YouTube Music", t("Finish signing in in the window that opened…"), div().text_size(px(12.0)).text_color(rgba(TERTIARY)).child(t("Waiting"))),
+            (None, true, _) => row(
+                "YouTube Music",
+                t("Finish signing in in the window that opened…"),
+                pill("cancel-sign-in", "Cancel", false).on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))),
+            ),
             (None, false, true) => match self.account_error.clone() {
                 // The account's name didn't come; the session may still work. Signing out and
                 // in again is the way out when it doesn't.
@@ -392,7 +396,9 @@ impl NabyTune {
                     tf("Signed in, but your account didn't load: {}", &[&e]),
                     pill("sign-out", "Sign out", false).on_click(cx.listener(|this, _, _, cx| this.sign_out(cx))),
                 ),
-                None => row("YouTube Music", t("Signed in; loading your account…"), div()),
+                None => row("YouTube Music", t("Signed in; loading your account…"),
+                    pill("sign-out", "Sign out", false).on_click(cx.listener(|this, _, _, cx| this.sign_out(cx))),
+                ),
             },
             (None, false, false) => row(
                 "YouTube Music",
@@ -401,7 +407,7 @@ impl NabyTune {
             ),
         };
         let mut rows = vec![row_view];
-        if self.youtube.signed_in() && !self.signing_in {
+        if self.youtube.signed_in() && self.sign_in_cancel.is_none() {
             rows.push(row(
                 "Sync likes with YouTube Music",
                 t("Songs you like here are liked on YouTube Music too, and the other way round"),
@@ -756,15 +762,27 @@ impl NabyTune {
         static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         const ENGLISH: [(&str, &str); 4] =
             [("City lights are fading out", ""), ("Hold on to the night", ""), ("Sing it one more time", ""), ("Till the morning comes", "")];
-        const JAPANESE: [(&str, &str); 4] = [
-            ("夢ならばどれほどよかったでしょう", "Yume naraba dorehodo yokatta deshou"),
-            ("未だにあなたのことを夢にみる", "Imadani anata no koto o yume ni miru"),
-            ("忘れた物を取りに帰るように", "Wasureta mono o tori ni kaeru you ni"),
-            ("古びた思い出の埃を払う", "Furubita omoide no hokori o harau"),
+        const KOREAN: [(&str, &str); 4] = [
+            ("같이 걸어요", "Gachi georeoyo"),
+            ("밤하늘을 봐요", "Bamhaneureul bwayo"),
+            ("별이 빛나요", "Byeori binnayo"),
+            ("다시 만나요", "Dasi mannayo"),
         ];
         // Moving: ask for the next frame (only while Settings shows).
         window.request_animation_frame();
-        let lines = if self.show_romaji { &JAPANESE } else { &ENGLISH };
+        use crate::lyrics_view::LyricLanguage;
+        const JAPANESE_ENGLISH: [(&str, &str); 5] = [
+            ("静かな夜", "A quiet night"),
+            ("空を見上げて", "Looking up at the sky"),
+            ("星を探した", "I searched for the stars"),
+            ("光が見えた", "I saw a light"),
+            ("歩き続ける", "I keep walking"),
+        ];
+        let lines: &[(&str, &str)] = match self.lyric_language {
+            LyricLanguage::Original => &ENGLISH,
+            LyricLanguage::LatinBelow | LyricLanguage::LatinOnly => &KOREAN,
+            LyricLanguage::English => &JAPANESE_ENGLISH,
+        };
         let t = START.get_or_init(Instant::now).elapsed().as_secs_f32();
         let period = 2.8;
         let index = (t / period) as usize % lines.len();
@@ -782,7 +800,7 @@ impl NabyTune {
             _ => (21.0, 0.3),
         };
         let height = 210.0;
-        let spacing = base * 2.3 + if self.show_romaji { 14.0 } else { 0.0 };
+        let spacing = base * 2.3 + if matches!(self.lyric_language, LyricLanguage::LatinBelow | LyricLanguage::English) { 14.0 } else { 0.0 };
         let centred = matches!(look, Look::Center | Look::Single);
         let mut stage = div()
             .relative()
@@ -798,7 +816,8 @@ impl NabyTune {
             .border_1()
             .border_color(rgba(STROKE));
         for d in -2i32..=2 {
-            let (text, romaji) = lines[(index as i32 + d).rem_euclid(lines.len() as i32) as usize];
+            let (original, extra) = lines[(index as i32 + d).rem_euclid(lines.len() as i32) as usize];
+            let (text, secondary) = self.lyric_language.display(original, Some(extra));
             let y = (d as f32 - glide) * spacing;
             // 1 on the sung line, falling to 0 a line away.
             let e = (1.0 - y.abs() / spacing).clamp(0.0, 1.0);
@@ -846,8 +865,8 @@ impl NabyTune {
                 .text_color(rgb(colour))
                 .when_some(blur, |l, b| l.blur(px(b)))
                 .child(words)
-                .when(!romaji.is_empty(), |l| {
-                    l.child(div().text_size(px(size * 0.56)).line_height(px(size * 0.75)).font_weight(FontWeight::MEDIUM).text_color(rgba(0xffffffcc)).child(romaji))
+                .when_some(secondary, |l, reading| {
+                    l.child(div().text_size(px(size * 0.56)).line_height(px(size * 0.75)).font_weight(FontWeight::MEDIUM).text_color(rgba(0xffffffcc)).child(reading))
                 });
             stage = stage.child(line);
         }
@@ -855,6 +874,7 @@ impl NabyTune {
     }
 
     fn lyrics_section(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::lyrics_view::LyricLanguage;
         let looks = Look::ALL.iter().map(|l| (*l, SharedString::from(l.name()))).collect();
         let sources = SOURCES.iter().map(|(key, label)| (*key, SharedString::from(t(label)))).collect();
         let preferred = SOURCES.iter().map(|(key, _)| *key).find(|key| *key == self.preferred_source).unwrap_or("");
@@ -868,14 +888,15 @@ impl NabyTune {
             vec![
                 self.lyric_preview(window),
                 row(
-                    "Romaji",
-                    t("Lyrics in other scripts, in Latin letters under each line: Japanese, Chinese, Korean, Russian, Greek, Hindi, Thai, Arabic"),
-                    switch("romaji", self.show_romaji).on_click(cx.listener(|this, _, _, cx| {
-                        this.show_romaji = !this.show_romaji;
-                        settings::set("lyrics_romaji", if this.show_romaji { "1" } else { "0" });
-                        this.fetch_extras(cx);
-                        cx.notify();
-                    })),
+                    "Lyric language",
+                    t("Show lyrics in Latin letters, alongside the original, or with English translation when available"),
+                    self.segmented(
+                        "lyric-language",
+                        LyricLanguage::ALL.into_iter().map(|language| (language, language.label().into())).collect(),
+                        self.lyric_language,
+                        |this, language, _, cx| this.set_lyric_language(language, cx),
+                        cx,
+                    ),
                 ),
                 row(
                     "Blur other lines",
@@ -1153,9 +1174,31 @@ impl NabyTune {
                         .on_click(cx.listener(|this, _, _, cx| this.open_mini_player(cx))),
                 ),
                 row(
+                    "Mini player preset",
+                    t("Choose the cover layout, colors and lyric emphasis for the mini player"),
+                    self.segmented(
+                        "mini-preset",
+                        crate::mini::Preset::ALL.into_iter().map(|preset| (preset, preset.name().into())).collect(),
+                        crate::mini::Preset::selected(),
+                        |this, preset, _, cx| this.set_mini_preset(preset, cx),
+                        cx,
+                    ),
+                ),
+                row(
                     "Lyrics on the desktop",
                     t("The sung line floats over everything, games and other apps too (Ctrl+D)"),
                     switch("desk-lyrics", self.desk_lyrics.is_some()).on_click(cx.listener(|this, _, _, cx| this.toggle_desktop_lyrics(cx))),
+                ),
+                row(
+                    "Desktop lyrics preset",
+                    t("Choose a style for floating lyrics. Each preset remembers its backdrop and border."),
+                    self.segmented(
+                        "desk-preset",
+                        crate::desktop_lyrics::Preset::ALL.into_iter().map(|preset| (preset, preset.name().into())).collect(),
+                        crate::desktop_lyrics::Preset::selected(),
+                        |this, preset, _, cx| this.set_desktop_lyrics_preset(preset, cx),
+                        cx,
+                    ),
                 ),
                 row(
                     "Lock the desktop lyrics",

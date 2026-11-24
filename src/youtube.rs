@@ -465,6 +465,21 @@ fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
+fn suggestion_queries(response: &Value, input: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    find_all(response, "searchSuggestionRenderer", &mut rows);
+    let mut seen = std::collections::HashSet::from([input.trim().to_lowercase()]);
+    rows.into_iter()
+        .filter_map(|row| {
+            let label = &row["navigationEndpoint"]["searchEndpoint"]["query"];
+            let query = label.as_str().map(str::to_owned).unwrap_or_else(|| runs(&row["suggestion"]));
+            let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!query.is_empty() && seen.insert(query.to_lowercase())).then_some(query)
+        })
+        .take(6)
+        .collect()
+}
+
 impl YouTube {
     pub fn new() -> Self {
         let http = reqwest::blocking::Client::builder()
@@ -474,19 +489,29 @@ impl YouTube {
         Self { http, visitor: Mutex::new(None), account: Mutex::new(None) }
     }
 
+    fn suggestion_request(&self, query: &str, language: &str) -> reqwest::blocking::RequestBuilder {
+        self.http
+            .post("https://music.youtube.com/youtubei/v1/music/get_search_suggestions?prettyPrint=false")
+            .header("origin", "https://music.youtube.com")
+            .json(&json!({
+                "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": WEB_REMIX_VERSION, "hl": language } },
+                "input": query,
+            }))
+    }
+
+    pub fn search_suggestions(&self, query: &str, language: &str) -> Result<Vec<String>> {
+        let response = self.suggestion_request(query, language)
+            .timeout(Duration::from_secs(4))
+            .send()?.error_for_status()?.json()?;
+        Ok(suggestion_queries(&response, query))
+    }
+
     /// A visitor ID, asked for once: any WEB_REMIX response carries one.
     fn visitor_data(&self) -> Result<String> {
         if let Some(v) = self.visitor.lock().unwrap().clone() {
             return Ok(v);
         }
-        let response: Value = self
-            .http
-            .post("https://music.youtube.com/youtubei/v1/music/get_search_suggestions?prettyPrint=false")
-            .header("origin", "https://music.youtube.com")
-            .json(&json!({
-                "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": WEB_REMIX_VERSION, "hl": "en" } },
-                "input": "",
-            }))
+        let response: Value = self.suggestion_request("", "en")
             .send()?
             .error_for_status()?
             .json()?;
@@ -587,6 +612,15 @@ impl YouTube {
     /// Signs requests with this session from now on (None: as a visitor again).
     pub fn set_account(&self, cookie: Option<String>) {
         *self.account.lock().unwrap() = cookie;
+    }
+
+    /// Pins the session for an operation queued by the UI, even if the account later changes.
+    pub fn account_snapshot(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            visitor: Mutex::new(self.visitor.lock().unwrap().clone()),
+            account: Mutex::new(self.account.lock().unwrap().clone()),
+        }
     }
 
     pub fn signed_in(&self) -> bool {
@@ -1145,5 +1179,30 @@ impl YouTube {
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_distinct_query_suggestions_in_provider_order() {
+        let row = |query: &str| json!({
+            "searchSuggestionRenderer": {
+                "navigationEndpoint": { "searchEndpoint": { "query": query } }
+            }
+        });
+        let response = json!({ "contents": [
+            row("Crazy"), row("crazy frog"), row("CRAZY FROG"), row("crazy rasta"),
+            { "searchSuggestionRenderer": { "suggestion": { "runs": [{ "text": "crazy " }, { "text": "for you" }] } } },
+            { "musicResponsiveListItemRenderer": { "title": "A song result" } },
+            row(" "), row("crazy remix"), row("crazy live"), row("crazy karaoke"), row("crazy piano")
+        ] });
+        assert_eq!(
+            suggestion_queries(&response, "crazy"),
+            ["crazy frog", "crazy rasta", "crazy for you", "crazy remix", "crazy live", "crazy karaoke"],
+        );
+        assert!(suggestion_queries(&Value::Null, "crazy").is_empty());
     }
 }

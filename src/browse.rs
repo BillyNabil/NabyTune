@@ -11,6 +11,7 @@ impl NabyTune {
         self.searching = true;
         self.search_error = None;
         self.query = query.clone().into();
+        let requested = self.query.clone();
         cx.notify();
         let youtube = self.youtube.clone();
         // A song's link pasted in (shared from NabyTune or YouTube Music): that song.
@@ -26,6 +27,9 @@ impl NabyTune {
                 })
                 .await;
             let _ = this.update(cx, |app, cx| {
+                if app.query != requested {
+                    return;
+                }
                 app.searching = false;
                 match result {
                     Ok(items) => {
@@ -121,10 +125,14 @@ impl NabyTune {
     /// YouTube Music's Home shelves, then their artwork in the background.
     pub(crate) fn load_feed(&mut self, cx: &mut Context<Self>) {
         self.feed = Feed::Loading;
+        let revision = self.account_revision;
         let youtube = self.youtube.clone();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { youtube.home() }).await;
             let _ = this.update(cx, |app, cx| {
+                if app.account_revision != revision {
+                    return;
+                }
                 match result {
                     Ok(shelves) => {
                         let shelves: Vec<FeedShelf> = shelves
@@ -286,14 +294,18 @@ impl NabyTune {
 
     /// Who is signed in, and their playlists.
     pub(crate) fn load_account(&mut self, cx: &mut Context<Self>) {
+        let revision = self.account_revision;
         let youtube = self.youtube.clone();
         cx.spawn(async move |this, cx| {
             let found = cx.background_executor().spawn(async move { (youtube.account_info(), youtube.account_playlists()) }).await;
             let _ = this.update(cx, |app, cx| {
+                if app.account_revision != revision {
+                    return;
+                }
                 match found {
                     (Ok(info), playlists) => {
                         if let Some(photo) = info.photo.clone() {
-                            app.fetch_art_at("account".into(), photo, 96, 64, cx);
+                            app.fetch_art_at(format!("account:{}", app.account_revision), photo, 96, 64, cx);
                         }
                         app.account = Some(info);
                         app.account_error = None;
@@ -323,27 +335,38 @@ impl NabyTune {
 
     /// Opens Google's sign-in window; once signed in, everything reloads as the account.
     pub(crate) fn sign_in(&mut self, cx: &mut Context<Self>) {
-        if self.signing_in {
+        if self.sign_in_cancel.is_some() || self.youtube.signed_in() {
             return;
         }
-        self.signing_in = true;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.sign_in_cancel = Some(cancel.clone());
         self.account_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { account::sign_in() }).await;
+            let worker_cancel = cancel.clone();
+            let result = cx.background_executor().spawn(async move { account::sign_in(&worker_cancel) }).await;
             let _ = this.update(cx, |app, cx| {
-                app.signing_in = false;
-                match result {
+                app.sign_in_cancel = None;
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    cx.notify();
+                    return;
+                }
+                match result.and_then(|cookie| {
+                    if let Some(cookie) = &cookie {
+                        account::save(cookie)?;
+                    }
+                    Ok(cookie)
+                }) {
                     Ok(Some(cookie)) => {
-                        if let Err(e) = account::save(&cookie) {
-                            app.account_error = Some(format!("{e:#}"));
-                        }
+                        app.account_revision += 1;
                         app.youtube.set_account(Some(cookie));
                         app.load_account(cx);
                         app.load_feed(cx);
                     }
                     Ok(None) => {}
-                    Err(e) => app.account_error = Some(format!("{e:#}")),
+                    Err(e) => app.account_error = Some(e.downcast_ref::<account::SignInIssue>()
+                        .map(|issue| t(issue.message()).to_owned())
+                        .unwrap_or_else(|| format!("{e:#}"))),
                 }
                 cx.notify();
             });
@@ -351,10 +374,29 @@ impl NabyTune {
         .detach();
     }
 
+    pub(crate) fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = &self.sign_in_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
-        cx.background_executor().spawn(async { account::sign_out() }).detach();
+        if let Err(error) = account::sign_out() {
+            self.note(tf("Couldn't sign out: {}", &[&format!("{error:#}")]), cx);
+            return;
+        }
+        cx.background_executor().spawn(async { account::clear_legacy_browser_data() }).detach();
+        self.art.remove(&format!("account:{}", self.account_revision));
+        self.account_revision += 1;
         self.youtube.set_account(None);
         self.account = None;
+        if self.collection_view.as_ref().is_some_and(|view| self.account_playlists.iter().any(|card| card.browse_id == view.card.browse_id)) {
+            self.collection_view = None;
+            if self.tab == Tab::Collection {
+                self.tab = Tab::Library;
+            }
+        }
         self.account_playlists.clear();
         // Another account signing in starts afresh: no hearts taken away for this one's.
         self.library.forget_account();
@@ -371,10 +413,14 @@ impl NabyTune {
         self.playlist_menu = None;
         self.playlist_menu_closed = Instant::now();
         let Some(id) = card.browse_id.clone() else { return };
-        let (youtube, video_id) = (self.youtube.clone(), track.video_id.clone());
+        let revision = self.account_revision;
+        let (youtube, video_id) = (self.youtube.account_snapshot(), track.video_id.clone());
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { youtube.add_to_playlist(&id, &video_id) }).await;
             let _ = this.update(cx, |app, cx| {
+                if app.account_revision != revision {
+                    return;
+                }
                 if let Err(e) = result {
                     app.error = Some(tf("Couldn't add to “{}”: {}", &[&card.title, &format!("{e:#}")]));
                     cx.notify();

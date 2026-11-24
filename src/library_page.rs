@@ -9,7 +9,7 @@ use crate::i18n::{songs, t};
 use crate::{artwork, brand_mark, NabyTune, Source, Track, ICONS, SECONDARY, STROKE, SUBTLE, SUBTLE_STRONG, TERTIARY};
 
 /// A pill button: accent-filled for the main action, quiet for the rest.
-fn button(id: &'static str, glyph: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn button(id: &'static str, glyph: &'static str, label: impl Into<SharedString>, primary: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(34.0))
@@ -281,6 +281,7 @@ impl NabyTune {
                         div()
                             .flex()
                             .gap_2()
+                            .flex_wrap()
                             .pt_2()
                             .child(button("playlist-play", "\u{E768}", t("Play"), true).when(empty, |d| d.opacity(0.4)).on_click(cx.listener(move |this, _, _, cx| {
                                 let tracks = this.tracks_of(Source::Playlist(p));
@@ -297,6 +298,13 @@ impl NabyTune {
                                     this.play_from(tracks, start, cx);
                                 }
                             })))
+                            .when(!empty, |d| d.child(button("playlist-share", crate::share::SHARE, t("Share playlist"), false).on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(playlist) = this.library.playlists.get(p) {
+                                    let title = playlist.name.clone();
+                                    let tracks = this.tracks_of(Source::Playlist(p));
+                                    this.share_collection(&title, None, &tracks, cx);
+                                }
+                            }))))
                             .child(button("playlist-rename", "\u{E8AC}", t("Rename"), false).on_click(cx.listener(move |this, _, window, cx| {
                                 this.renaming = true;
                                 let name = this.library.playlists[p].name.clone();

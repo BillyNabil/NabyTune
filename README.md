@@ -32,7 +32,7 @@ of your own whenever you want it.
 - **It's a real app, not a web page in a window.** NabyTune draws every frame itself on the GPU,
   plays audio through its own engine, and uses about **150 MB of memory**.
 - **Lyrics are the main event.** Lines are synced to the music and light up word by word. Japanese,
-  Chinese, Korean, Russian, Greek, Hindi, Thai and Arabic can show in Latin letters under every line.
+  Chinese, Korean, Russian, Greek, Hindi, Thai and Arabic can show in Latin letters below or in place of the original.
 - **Every song gets its own look.** The accent colour, the glow behind the app and the full-screen
   background all come from the cover that's playing.
 - **Your listening, kept on your PC.** Stats and ten Wrapped card designs work from your own
@@ -43,10 +43,10 @@ of your own whenever you want it.
 | | |
 |---|---|
 | 🎤 **Synced lyrics** | Word-by-word karaoke, six lyric looks, blur-to-focus, a click on a line jumps to it, and `[` / `]` move the timing when a source is off. Lyrics come from lrc.red, BiniLyrics, BetterLyrics, LyricsPlus, Unison, KuGou, LRCLIB and YouTube Music, asked all at once with word-timed sources first, and you can switch between them. |
-| 🔤 **Romaji and more** | Lyrics in Latin letters under each line: Japanese (kanji readings included), Chinese pinyin, Korean, Cyrillic, Greek, Devanagari, Thai and Arabic script. |
+| 🔤 **Lyrics in Latin letters** | Choose Latin only or Original + Latin for Japanese, Korean, Chinese, Cyrillic, Greek, Devanagari, Thai, Arabic and more. Readings are generated offline. |
 | 🖥️ **Full-screen stage** | Five layouts (*Side by side*, *Center*, *Full cover*, *Lyrics only*, *Card*), five backgrounds, and visuals that move with the beat. |
-| 🪟 **Lyrics on the desktop** | The sung line floats over games, browsers and anything else. Lock it and clicks pass straight through. Its background can be none, a soft shadow, see-through or dark. |
-| 📻 **Mini player** | A small window that stays on top, showing the song as written, with romaji, or in romaji only. |
+| 🪟 **Lyrics on the desktop** | The sung line floats over games, browsers and anything else. Lock it and clicks pass straight through. Pick Custom, Cinema, Neon, or Editorial in Settings or from the overlay. Each preset remembers its backdrop and border. |
+| 📻 **Mini player** | A small window that stays on top. Pick Classic, Vinyl, Cassette, or Spotlight in Settings or click the preset name in the player. Lyrics can show Latin letters or an English translation when available. |
 | 📊 **Stats and Wrapped** | Minutes, top songs and artists, when you listen, and new discoveries. Ten Wrapped card designs, each saved as a picture in one click. |
 | ♾️ **Endless radio** | Start a radio from any song or artist and steer it toward *Popular*, *Discover*, *Deep cuts* and more. |
 | 🎧 **Listen along** | Host a session and share its code: friends hear the same song at the same moment, each on their own PC, and can send songs to your queue. |

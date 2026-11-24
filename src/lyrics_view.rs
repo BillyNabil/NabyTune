@@ -3,7 +3,122 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LyricLanguage {
+    Original,
+    LatinBelow,
+    LatinOnly,
+    English,
+}
+
+impl LyricLanguage {
+    pub(crate) const ALL: [Self; 4] = [Self::Original, Self::LatinBelow, Self::LatinOnly, Self::English];
+
+    pub(crate) fn load() -> Self {
+        match settings::get("lyrics_language").as_deref() {
+            Some("romaji") => Self::LatinBelow,
+            Some(key) => Self::from_key(key),
+            None if settings::get("lyrics_romaji").as_deref() == Some("1") => Self::LatinBelow,
+            None => Self::Original,
+        }
+    }
+
+    pub(crate) fn load_mini() -> Self {
+        match settings::get("mini_romaji").as_deref() {
+            Some("both") => Self::LatinBelow,
+            Some("romaji") => Self::LatinOnly,
+            Some(key) => Self::from_key(key),
+            None => Self::Original,
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        Self::ALL.into_iter().find(|mode| mode.key() == key).unwrap_or(Self::Original)
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::LatinBelow => "latin_below",
+            Self::LatinOnly => "latin_only",
+            Self::English => "english",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        t(match self {
+            Self::Original => "Original",
+            Self::LatinBelow => "Original + Latin",
+            Self::LatinOnly => "Latin only",
+            Self::English => "English translation",
+        })
+    }
+
+    pub(crate) fn short_label(self) -> &'static str {
+        t(match self {
+            Self::Original => "Orig",
+            Self::LatinBelow => "A+",
+            Self::LatinOnly => "ABC",
+            Self::English => "EN",
+        })
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Original => Self::LatinBelow,
+            Self::LatinBelow => Self::LatinOnly,
+            Self::LatinOnly => Self::English,
+            Self::English => Self::Original,
+        }
+    }
+
+    pub(crate) fn wants_latin(self) -> bool {
+        matches!(self, Self::LatinBelow | Self::LatinOnly)
+    }
+
+    pub(crate) fn display<'a>(self, original: &'a str, extra: Option<&'a str>) -> (&'a str, Option<&'a str>) {
+        let extra = extra.map(str::trim).filter(|line| !line.is_empty() && *line != original.trim());
+        match self {
+            Self::Original => (original, None),
+            Self::LatinBelow | Self::English => (original, extra),
+            Self::LatinOnly => (extra.unwrap_or(original), None),
+        }
+    }
+}
+
 impl NabyTune {
+    pub(crate) fn set_lyric_language(&mut self, language: LyricLanguage, cx: &mut Context<Self>) {
+        self.lyric_language = language;
+        settings::set("lyrics_language", language.key());
+        self.fetch_extras(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_lyric_language(&mut self, cx: &mut Context<Self>) {
+        self.set_lyric_language(self.lyric_language.next(), cx);
+    }
+
+    pub(crate) fn lyric_language_note(&self) -> Option<SharedString> {
+        match self.lyric_language {
+            LyricLanguage::English if matches!(self.lyrics, Lyrics::Ready(_)) && self.extras.english.is_none() =>
+                Some(t("English translation unavailable for this song").into()),
+            LyricLanguage::LatinBelow | LyricLanguage::LatinOnly => self.extras.note.clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lyric_extras(&self, mode: LyricLanguage) -> Option<&[Option<String>]> {
+        match mode {
+            LyricLanguage::Original => None,
+            LyricLanguage::LatinBelow | LyricLanguage::LatinOnly => self.extras.romaji.as_deref(),
+            LyricLanguage::English => self.extras.english.as_deref(),
+        }
+    }
+
+    pub(crate) fn displayed_lyric<'a>(&'a self, mode: LyricLanguage, text: &'a str, index: usize) -> (&'a str, Option<&'a str>) {
+        mode.display(text, extra_at(self.lyric_extras(mode), index))
+    }
+
     /// The lyrics, once the track's length is known (the exact matches need it): every source
     /// at once. The one picked for this song before is shown, else the best.
     pub(crate) fn fetch_lyrics(&mut self, generation: u64, video_id: String, title: String, artist: String, length: Duration, cx: &mut Context<Self>) {
@@ -44,6 +159,16 @@ impl NabyTune {
                 self.lyric_motion = LyricMotion::new(found.lines.len());
                 self.lyrics_source = found.source.into();
                 self.lyrics_synced = found.synced;
+                let other = self.lyric_options.iter().filter(|alternative| alternative.synced && found.synced)
+                    .flat_map(|alternative| &alternative.lines).filter(|line| line.english.is_some())
+                    .collect::<Vec<_>>();
+                let english: Vec<_> = found.lines.iter().map(|line| {
+                    line.english.clone().or_else(|| other.iter().filter(|candidate| {
+                        candidate.text == line.text && candidate.at.abs_diff(line.at) <= Duration::from_millis(750)
+                    }).min_by_key(|candidate| candidate.at.abs_diff(line.at)).and_then(|candidate| candidate.english.clone()))
+                        .filter(|text| text.trim() != line.text.trim())
+                }).collect();
+                self.extras.english = english.iter().any(Option::is_some).then_some(english);
                 Lyrics::Ready(found.lines.clone())
             }
             None => Lyrics::Missing,
@@ -73,7 +198,7 @@ impl NabyTune {
             self.extras.romaji = self.extras_cache.get(&key).cloned();
         }
         // Worked out for the lyrics view, or for the mini player when it shows romaji.
-        let wanted = self.show_romaji || (self.mini.is_some() && self.mini_romaji.wants_romaji());
+        let wanted = self.lyric_language.wants_latin() || (self.mini.is_some() && self.mini_lyric_language.wants_latin());
         if wanted && self.extras.romaji.is_none() && !self.extras.romaji_pending {
             self.extras.romaji_pending = true;
             self.extras.note = None;
@@ -93,18 +218,13 @@ impl NabyTune {
                             app.extras_cache.insert(key, romaji.clone());
                             app.extras.romaji = Some(romaji);
                         }
-                        Err(e) => app.extras.note = Some(short_error("Romaji", &e)),
+                        Err(e) => app.extras.note = Some(short_error(t("Latin script"), &e)),
                     }
                     cx.notify();
                 });
             })
             .detach();
         }
-    }
-
-    /// What shows under each lyric line: its romaji, when that's switched on.
-    pub(crate) fn under_lines(&self) -> Option<Vec<Option<String>>> {
-        self.extras.romaji.clone().filter(|_| self.show_romaji)
     }
 
     /// The lyric line being sung, a touch early as karaoke does: it lights as it begins.
@@ -147,14 +267,15 @@ impl NabyTune {
             Lyrics::Missing => return message(t("No lyrics found for this song").into()),
             Lyrics::Idle => return message(t("Play a song to see its lyrics").into()),
         };
-        let romaji = self.under_lines();
         if !self.lyrics_synced {
-            return self.plain_lyrics(style, &lines, romaji);
+            return self.plain_lyrics(style, &lines);
         }
         if self.look == Look::Single {
             return self.single_line(style, &lines, window, cx);
         }
 
+        let mode = self.lyric_language;
+        let extras = self.lyric_extras(mode).map(<[_]>::to_vec);
         let look = self.look;
         let blur_on = self.blur_lyrics && look.blurs();
         let now = self.lyric_now();
@@ -225,7 +346,8 @@ impl NabyTune {
             });
             let text_size = style.text * size * scale;
             let at = line.at;
-            let text = if line.text.is_empty() { "♪".to_string() } else { line.text.clone() };
+            let (shown, secondary) = mode.display(&line.text, extra_at(extras.as_deref(), i));
+            let text = if shown.is_empty() { "♪" } else { shown };
             let row = div()
                 // The filter only where it shows: an unblurred line, or one far off screen,
                 // skips the offscreen pass a blur costs.
@@ -247,7 +369,7 @@ impl NabyTune {
                     }
                     cx.notify();
                 }));
-            let row = if look == Look::Karaoke && lit && !line.words.is_empty() {
+            let row = if look == Look::Karaoke && lit && shown == line.text && !line.words.is_empty() {
                 // Each word lights as it's sung, by the source's own word timings.
                 let mut spans = div().flex().flex_wrap();
                 for word in &line.words {
@@ -269,7 +391,7 @@ impl NabyTune {
                 let span = end.saturating_sub(at).max(Duration::from_millis(800)).mul_f32(0.9);
                 let progress = (now.saturating_sub(at).as_secs_f32() / span.as_secs_f32()).clamp(0.0, 1.0);
                 let mut units: Vec<(String, bool)> = Vec::new();
-                for word in line.text.split_whitespace() {
+                for word in shown.split_whitespace() {
                     if word.chars().any(|c| (c as u32) >= 0x2E80) {
                         let chars: Vec<char> = word.chars().collect();
                         units.extend(chars.iter().enumerate().map(|(n, c)| (c.to_string(), n + 1 == chars.len())));
@@ -295,9 +417,9 @@ impl NabyTune {
                 }
                 row.child(spans)
             } else {
-                row.child(text)
+                row.child(text.to_owned())
             };
-            let row = row.children(extras_under(&romaji, i, text_size, look == Look::Center));
+            let row = row.children(secondary.map(|text| extras_under(text, text_size, look == Look::Center)));
             let row = match opacity {
                 Some(f) => f.apply(row).into_any_element(),
                 None => row.into_any_element(),
@@ -342,7 +464,7 @@ impl NabyTune {
     }
 
     /// Lyrics without timings (YouTube Music's own text): every line plain, scrolled by hand.
-    pub(crate) fn plain_lyrics(&self, style: &LyricStyle, lines: &[lyrics::Line], romaji: Option<Vec<Option<String>>>) -> AnyElement {
+    fn plain_lyrics(&self, style: &LyricStyle, lines: &[lyrics::Line]) -> AnyElement {
         let text = style.text * 0.8;
         let mut column = div().flex().flex_col().gap(px(style.gap * 0.7)).px(px(style.pad)).pb(px(40.0));
         column = column.child(
@@ -352,6 +474,7 @@ impl NabyTune {
                 .child(tf("Lyrics from {} · not time-synced", &[&self.lyrics_source])),
         );
         for (i, line) in lines.iter().enumerate() {
+            let (shown, secondary) = self.displayed_lyric(self.lyric_language, &line.text, i);
             column = column.child(
                 div()
                     .flex()
@@ -361,8 +484,8 @@ impl NabyTune {
                     .text_size(px(text))
                     .line_height(px(text * 1.3))
                     .text_color(rgba(0xffffffd9))
-                    .child(line.text.clone())
-                    .children(extras_under(&romaji, i, text, false)),
+                    .child(shown.to_owned())
+                    .children(secondary.map(|line| extras_under(line, text, false))),
             );
         }
         div().id("plain-lyrics").size_full().overflow_y_scroll().child(column).into_any_element()
@@ -371,8 +494,15 @@ impl NabyTune {
     /// The single-line look: the sung line large in the middle, rising in as it changes,
     /// with the next one waiting small underneath.
     pub(crate) fn single_line(&mut self, style: &LyricStyle, lines: &[lyrics::Line], window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let romaji = self.under_lines();
         let active = self.sung_line();
+        let current = active.map(|i| self.displayed_lyric(self.lyric_language, &lines[i].text, i));
+        let main = current.map(|(text, _)| text).filter(|text| !text.is_empty()).unwrap_or("♪").to_owned();
+        let secondary = current.and_then(|(_, reading)| reading).map(str::to_owned);
+        let next_index = active.map_or(0, |i| i + 1);
+        let upcoming = lines.get(next_index)
+            .map(|line| self.displayed_lyric(self.lyric_language, &line.text, next_index).0)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
         let spring = self.spring;
         let motion = &mut self.lyric_motion;
         if motion.single_line != active {
@@ -386,13 +516,6 @@ impl NabyTune {
             window,
             cx,
         );
-        let current = active.map(|i| lines[i].text.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "♪".to_string());
-        let upcoming = match active {
-            Some(i) => lines.get(i + 1),
-            None => lines.first(),
-        }
-        .map(|l| l.text.clone())
-        .filter(|t| !t.is_empty());
         let big = style.text * 1.35;
         let at = active.map(|i| lines[i].at);
         div()
@@ -416,8 +539,8 @@ impl NabyTune {
                         .items_center()
                         .text_size(px(big))
                         .line_height(px(big * 1.25))
-                        .child(current)
-                        .children(active.and_then(|i| extras_under(&romaji, i, big, true)))
+                        .child(main)
+                        .children(secondary.as_deref().map(|line| extras_under(line, big, true)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(at) = at.filter(|_| this.length > Duration::ZERO) {
                                 this.seek(at.as_secs_f32() / this.length.as_secs_f32());
@@ -575,7 +698,7 @@ impl NabyTune {
         // Romaji has its own button on the full-screen player's rail (stage_rail); the side
         // panel, too narrow for it, keeps it here.
         let in_panel = self.look_menu == Some(LookAnchor::Panel);
-        let footnote = self.extras.note.clone();
+        let footnote = self.lyric_language_note();
         // Every version of the lyrics found, to pick another when the shown one is off.
         let mut sources = div().flex().flex_col().gap(px(1.0));
         for (n, found) in self.lyric_options.iter().enumerate() {
@@ -615,12 +738,13 @@ impl NabyTune {
                 cx.notify();
             })))
             .when(in_panel, |d| {
-                d.child(switch_row("look-romaji", t("Romaji"), self.show_romaji, false).on_click(cx.listener(|this, _, _, cx| {
-                    this.show_romaji = !this.show_romaji;
-                    settings::set("lyrics_romaji", if this.show_romaji { "1" } else { "0" });
-                    this.fetch_extras(cx);
-                    cx.notify();
-                })))
+                d.children(LyricLanguage::ALL.into_iter().filter(|mode| *mode != LyricLanguage::Original).map(|mode| {
+                    switch_row(mode.key(), mode.label(), self.lyric_language == mode, false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let language = if this.lyric_language == mode { LyricLanguage::Original } else { mode };
+                            this.set_lyric_language(language, cx);
+                        }))
+                }))
             })
             .when(has_sources, |d| {
                 d.child(div().my(px(4.0)).mx(px(6.0)).h(px(1.0)).bg(rgba(STROKE)))
@@ -674,16 +798,33 @@ impl NabyTune {
     }
 }
 
-/// Under lyric line `i`: its romanisation, when asked for and there.
-pub(crate) fn extras_under(romaji: &Option<Vec<Option<String>>>, i: usize, size: f32, centred: bool) -> Option<gpui::Div> {
-    let r = romaji.as_ref()?.get(i).cloned().flatten()?;
-    Some(
-        div()
-            .text_size(px(size * 0.56))
-            .line_height(px(size * 0.56 * 1.3))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(rgba(0xffffffcc))
-            .when(centred, |d| d.text_center())
-            .child(r),
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn displays_the_same_reading_across_lyric_views() {
+        let original = "같이 걸어요";
+        let reading = Some("Gachi georeoyo");
+        assert_eq!(LyricLanguage::LatinBelow.display(original, reading), (original, reading));
+        assert_eq!(LyricLanguage::LatinOnly.display(original, reading), ("Gachi georeoyo", None));
+        assert_eq!(LyricLanguage::LatinOnly.display("Hello", None), ("Hello", None));
+        assert_eq!(LyricLanguage::LatinBelow.display("Hello", Some("Hello")), ("Hello", None));
+        assert_eq!(LyricLanguage::English.display(original, Some("Let's walk together")), (original, Some("Let's walk together")));
+        assert!(LyricLanguage::ALL.into_iter().all(|mode| LyricLanguage::from_key(mode.key()) == mode));
+    }
+}
+
+fn extra_at(extras: Option<&[Option<String>]>, index: usize) -> Option<&str> {
+    extras?.get(index)?.as_deref()
+}
+
+fn extras_under(text: &str, size: f32, centred: bool) -> gpui::Div {
+    div()
+        .text_size(px(size * 0.56))
+        .line_height(px(size * 0.56 * 1.3))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgba(0xffffffcc))
+        .when(centred, |d| d.text_center())
+        .child(text.to_owned())
 }

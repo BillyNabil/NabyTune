@@ -7,7 +7,7 @@ use gpui_ce_motion::{Motion, Target, Transition};
 
 use crate::appearance::{self, accent, on_accent, Material, PRESETS};
 use crate::i18n::{t, tf};
-use crate::settings_page::{support_buttons, switch};
+use crate::settings_page::support_buttons;
 use crate::{brand_mark, settings, Look, NabyTune, DISPLAY, ICONS, SECONDARY, STROKE, SUBTLE_STRONG, TERTIARY};
 
 const STEPS: usize = 5;
@@ -211,7 +211,7 @@ impl NabyTune {
     }
 
     fn setup_account(&self, cx: &mut Context<Self>) -> AnyElement {
-        let status: AnyElement = match (&self.account, self.signing_in) {
+        let status: AnyElement = match (&self.account, self.sign_in_cancel.is_some()) {
             (Some(account), _) => div()
                 .flex()
                 .items_center()
@@ -219,7 +219,14 @@ impl NabyTune {
                 .child(div().font_family(ICONS).text_size(px(18.0)).text_color(rgb(accent())).child("\u{E73E}"))
                 .child(div().text_size(px(14.0)).child(tf("Signed in as {}", &[&account.name])))
                 .into_any_element(),
-            (None, true) => div().text_size(px(13.0)).text_color(rgba(SECONDARY)).child(t("Finish signing in in the window that opened…")).into_any_element(),
+            (None, true) => div().flex().items_center().gap_3()
+                .child(div().text_size(px(13.0)).text_color(rgba(SECONDARY)).child(t("Finish signing in in the window that opened…")))
+                .child(crate::library_page::button("setup-cancel-sign-in", "\u{E8BB}", t("Cancel"), false)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))))
+                .into_any_element(),
+            (None, false) if self.youtube.signed_in() => div().text_size(px(13.0)).text_color(rgba(SECONDARY))
+                .child(self.account_error.clone().unwrap_or_else(|| t("Signed in; loading your account…").into()))
+                .into_any_element(),
             (None, false) => div()
                 .flex()
                 .items_center()
@@ -282,12 +289,18 @@ impl NabyTune {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(label(t("Romaji"), t("Japanese, Chinese, Korean and more, in Latin letters under each line")))
-                    .child(switch("setup-romaji", self.show_romaji).on_click(cx.listener(|this, _, _, cx| {
-                        this.show_romaji = !this.show_romaji;
-                        settings::set("lyrics_romaji", if this.show_romaji { "1" } else { "0" });
-                        cx.notify();
-                    }))),
+                    .gap_3()
+                    .child(label(t("Lyric language"), t("Show lyrics in Latin letters, alongside the original, or with English translation when available")))
+                    .child({
+                        use crate::lyrics_view::LyricLanguage;
+                        self.segmented(
+                            "setup-lyric-language",
+                            LyricLanguage::ALL.into_iter().map(|language| (language, language.label().into())).collect(),
+                            self.lyric_language,
+                            |this, language, _, cx| this.set_lyric_language(language, cx),
+                            cx,
+                        )
+                    }),
             )
             .into_any_element()
     }
